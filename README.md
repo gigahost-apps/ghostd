@@ -70,7 +70,10 @@ limited to some addresses stays limited. `ghostd keys list` and
 
 With a forced-command key, any SSH connection with that key reaches
 `ghostd`: `ssh -T -i agent_key host`. With an ordinary key, run it
-yourself: `ssh -T host ghostd stdio`. Output a login shell prints first is
+yourself: `ssh -T host ghostd stdio`. A user install may need the full
+path, `ssh -T host ~/.local/bin/ghostd stdio`, because a non-login SSH
+command does not read `~/.profile`, which usually adds `~/.local/bin` to
+`PATH`. Output a login shell prints first is
 skipped: `ghostd` opens with a fixed marker and the client discards what
 comes before it.
 

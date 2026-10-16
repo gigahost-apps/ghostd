@@ -233,16 +233,15 @@ pub fn write(
     })
 }
 
+/// Non-overlapping occurrences of `needle`, left to right (a linear-time
+/// search, so a long nearly matching `needle` cannot stall a thread).
 fn find_all(hay: &[u8], needle: &[u8]) -> Vec<usize> {
     let mut found = Vec::new();
     let mut at = 0;
-    while at + needle.len() <= hay.len() {
-        match hay[at..].windows(needle.len()).position(|w| w == needle) {
-            Some(pos) => {
-                found.push(at + pos);
-                at += pos + needle.len();
-            }
-            None => break,
+    for pos in memchr::memmem::find_iter(hay, needle) {
+        if pos >= at {
+            found.push(pos);
+            at = pos + needle.len();
         }
     }
     found
@@ -354,6 +353,10 @@ struct Walk {
 }
 
 impl Walk {
+    /// Lists one directory. Its names are read and sorted whole before the
+    /// limits apply (the order is by name, so the first ones cannot be known
+    /// sooner): one directory with millions of entries costs memory in
+    /// proportion.
     fn dir(&mut self, dir: &Path, prefix: &[u8], depth_left: u32) -> io::Result<()> {
         let mut names: Vec<OsString> = fs::read_dir(dir)?
             .filter_map(Result::ok)

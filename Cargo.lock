@@ -315,6 +315,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "ignore",
+ "memchr",
  "nix",
  "rustix",
  "serde",

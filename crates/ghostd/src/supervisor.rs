@@ -113,6 +113,9 @@ pub fn daemon(paths: &Paths) -> ExitCode {
 fn spawn_worker(paths: &Paths) -> std::io::Result<tokio::process::Child> {
     let mut command = tokio::process::Command::new("/proc/self/exe");
     command.arg0("ghostd").arg("worker").stdin(Stdio::null());
+    // The worker writes to the log file it was started with: once the log
+    // is rotated, its later output goes to the renamed file (and is lost
+    // when that is removed). A restart opens the current file again.
     match (logfile::open(paths), logfile::open(paths)) {
         (Ok(out), Ok(err)) => {
             command.stdout(out).stderr(err);
