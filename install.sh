@@ -1,8 +1,8 @@
 #!/bin/sh
 # Builds ghostd from source and installs it, then runs `ghostd setup`.
 #
-# From a checkout:   sh install.sh [options] [-- <ghostd setup options>]
-# Piped from a tag:  curl -fsSL https://raw.githubusercontent.com/gigahost-apps/ghostd/<tag>/install.sh | sh -s -- [options] [-- <ghostd setup options>]
+# From a checkout:   sh install.sh [options]
+# Piped from a tag:  curl -fsSL https://raw.githubusercontent.com/gigahost-apps/ghostd/<tag>/install.sh | sh -s -- [options]
 #
 # Options:
 #   --ref <tag|branch|commit>  what to build when piped (default: the latest tag)
@@ -31,7 +31,7 @@ die() {
 
 usage() {
     cat >&2 <<'USAGE'
-usage: sh install.sh [--ref <tag|branch|commit>] [--prefix <dir>] [--no-rustup] [-- <ghostd setup options>]
+usage: sh install.sh [--ref <tag|branch|commit>] [--prefix <dir>] [--no-rustup]
 
   --ref <ref>     what to build when piped (default: the latest tag)
   --prefix <dir>  install <dir>/bin/ghostd (default: $HOME/.local, /usr/local as root)
@@ -74,16 +74,11 @@ while [ "$#" -gt 0 ]; do
             usage
             exit 0
             ;;
-        --)
-            shift
-            break
-            ;;
         *)
-            die "unknown option $1 (options for ghostd setup go after --)"
+            die "unknown option $1"
             ;;
     esac
 done
-# What remains in "$@" goes to `ghostd setup`.
 
 case "$ref" in
     *[!A-Za-z0-9._/-]*) die "--ref holds characters a tag, branch or commit does not: $ref" ;;
@@ -270,7 +265,7 @@ chmod 755 "$prefix/bin/ghostd.new"
 mv -f "$prefix/bin/ghostd.new" "$prefix/bin/ghostd"
 say "installed $prefix/bin/ghostd"
 
-"$prefix/bin/ghostd" setup --origin source --ref "$ref" --commit "$commit" "$@"
+"$prefix/bin/ghostd" setup --origin source --ref "$ref" --commit "$commit"
 
 if "$prefix/bin/ghostd" status 2>/dev/null | grep -q '"running":true'; then
     say "a ghostd daemon runs: the new binary takes effect after \`ghostd stop\` (the next \`ghostd stdio\` starts it again)"

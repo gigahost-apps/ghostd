@@ -313,6 +313,28 @@ async fn a_daemon_outlives_a_normal_exit_and_the_rest_is_stopped() {
 }
 
 #[tokio::test]
+async fn leftovers_that_ignore_sigterm_or_are_stopped_are_killed_before_the_answer() {
+    let env = Env::with_config("stop_grace_ms = 1000\n");
+    let c = env.connect().await;
+    // One leftover ignores SIGTERM, one is SIGSTOPped; both need the
+    // SIGKILL after the grace.
+    let r = exec(
+        &c,
+        sh("(trap '' TERM; exec sleep 309) >/dev/null 2>&1 & echo $!; sh -c 'kill -STOP $$' & echo $!; echo hi"),
+    )
+    .await;
+    assert_eq!(r.outcome, Outcome::Exited { code: 0 }, "{r:?}");
+    let text = String::from_utf8(r.stdout.data.clone()).unwrap();
+    let pids: Vec<u32> = text.lines().filter_map(|l| l.parse().ok()).collect();
+    assert_eq!(pids.len(), 2, "{text}");
+    assert_eq!(r.stopped, 2, "{r:?}");
+    for pid in pids {
+        // Reaped or not yet, none may still run.
+        assert!(!common::alive(pid), "pid {pid} outlived the Exec");
+    }
+}
+
+#[tokio::test]
 async fn a_plain_exit_stops_nothing() {
     let env = Env::new();
     let c = env.connect().await;

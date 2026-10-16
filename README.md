@@ -78,8 +78,9 @@ keep a server running, start it with `JobStart`: then what the program
 leaves in the background belongs to the job, which lives until none of it
 is left, and `JobStop` (or the job's timeout) stops it all. A process that
 detaches into a session of its own (`setsid`, a daemon's own forking, as
-`pg_ctl start` or `nginx` do) is left running either way and is not waited
-for, and a service started with `systemctl start` is systemd's, not the
+`pg_ctl start` or `nginx` do) is left running when the program ends and is not
+waited for (a stop or timeout before the job finishes takes the whole tree,
+detached processes included), and a service started with `systemctl start` is systemd's, not the
 job's.
 
 ## Commands

@@ -142,7 +142,7 @@ and is not waited for: daemons detach that way (`setsid`,
 process is then init's, not the job's; it should not keep the job's stdout
 or stderr open (daemons redirect them), since nothing reads them once the
 shim is gone. A service started with `systemctl start` is systemd's child,
-not the job's, so it runs on either way.
+not the job's, so it runs on when the job ends. A stop or timeout before the job finishes takes the whole tree, detached processes included.
 
 | Request | Answer | Notes |
 |---|---|---|
@@ -153,7 +153,7 @@ not the job's, so it runs on either way.
 | `JobStatus { job_id }` | `Job(JobInfo)` | `JobInfo { job_id, name, argv_summary, state, started_at_ms, ended_at_ms, stdout_total, stderr_total, pid, processes, finished }`, `state` the program's: `Running`, `Exited { code }`, `Signaled { signal }` or `Lost` (its shim vanished before the job finished, also after the program ended: what is left of the job may still run, and nothing watches, stops or kills it any more). `processes`: the processes still in the job's session, the program included (0 once finished). `finished`: none is left and the final state is written, or the job is `Lost`. |
 | `JobWait { job_id, timeout_ms }` | `Job(JobInfo)` | When it is `finished`, or at the timeout (at most 60 s) with `finished: false`. |
 | `JobLogRead { job_id, stream, offset, max_len }` | `LogSlice { data, offset, total, first_available, ended }` | `offset` `None` reads the last `max_len` bytes. Logs rotate per stream at `log_max_bytes`, one rotated file kept; `first_available` is the lowest offset still kept. `ended`: the job is `finished` and `total` is final. |
-| `JobSignal { job_id, signal }` | `Done` | To the program's process group; `Conflict` when it has ended. |
+| `JobSignal { job_id, signal }` | `Done` | To the program's process group; `Conflict` once the program has ended (also while its leftovers keep the job unfinished: use `JobStop`). |
 | `JobStop { job_id, grace_ms }` | `Job(JobInfo)` | Answers once everything the job started is gone. |
 | `JobRemove { job_id }` | `Done` | `Busy` until it is `finished`. |
 

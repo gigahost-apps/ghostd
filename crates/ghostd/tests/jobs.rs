@@ -665,18 +665,17 @@ async fn a_detached_process_is_not_waited_for() {
     .await;
     let begun = Instant::now();
     let info = wait_job(&c, &job).await;
-    assert!(info.finished);
-    assert_eq!(info.state, JobState::Exited { code: 0 });
-    assert!(
-        begun.elapsed() < Duration::from_secs(3),
-        "{:?}",
-        begun.elapsed()
-    );
+    let waited = begun.elapsed();
     let out = log(&c, &job, Stream::Stdout, Some(0), 100).await;
     let pid: u32 = String::from_utf8(out.data).unwrap().trim().parse().unwrap();
-    assert!(alive(pid), "the detached process was killed");
+    // Killed before any assertion, so a failure leaks nothing.
+    let was_alive = alive(pid);
     signal(pid, 9);
     wait_gone(pid);
+    assert!(info.finished);
+    assert_eq!(info.state, JobState::Exited { code: 0 });
+    assert!(waited < Duration::from_secs(3), "{waited:?}");
+    assert!(was_alive, "the detached process was killed");
 }
 
 #[tokio::test]
