@@ -183,7 +183,9 @@ if [ -z "$src" ]; then
         fetch "$API_URL/tags" "$tmp/tags.json" ||
             die "cannot list the release tags from GitHub's API (its limit is 60 calls an hour per address without a token): pass --ref <tag>, the latest from https://github.com/gigahost-apps/ghostd/tags"
         # One field per line first, so that the first tag's name is taken
-        # however the JSON is laid out.
+        # however the JSON is laid out. Each of the three characters
+        # becomes a newline (the repeated newline is on purpose).
+        # shellcheck disable=SC2020
         ref=$(tr ',{}' '\n\n\n' <"$tmp/tags.json" |
             sed -n 's/^[[:space:]]*"name":[[:space:]]*"\([A-Za-z0-9._/-]*\)"[[:space:]]*$/\1/p' | head -n 1)
         if [ -z "$ref" ]; then
@@ -210,7 +212,9 @@ if [ -z "$src" ]; then
     mkdir "$tmp/source"
     tar -xzf "$tmp/source.tar.gz" -C "$tmp/source" || die "cannot unpack $archive"
     src=$(find "$tmp/source" -mindepth 1 -maxdepth 1 -type d | head -n 1)
-    [ -n "$src" ] && [ -f "$src/Cargo.toml" ] || die "the archive holds no ghostd source"
+    if [ -z "$src" ] || [ ! -f "$src/Cargo.toml" ]; then
+        die "the archive holds no ghostd source"
+    fi
 else
     commit=unknown
     ref=checkout

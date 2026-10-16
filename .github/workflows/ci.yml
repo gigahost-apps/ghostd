@@ -11,7 +11,7 @@ jobs:
   check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Toolchain (pinned in rust-toolchain.toml)
         run: rustup show active-toolchain || rustup toolchain install
       - name: Format
@@ -33,7 +33,7 @@ jobs:
         runner: [ubuntu-latest, ubuntu-24.04-arm]
     runs-on: ${{ matrix.runner }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: rustup when the image has none
         run: |
           if ! command -v rustup >/dev/null; then
@@ -58,7 +58,7 @@ jobs:
   install-script:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Syntax
         run: sh -n install.sh
       - name: Shellcheck
@@ -67,7 +67,7 @@ jobs:
   fuzz:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Nightly and cargo-fuzz
         run: |
           rustup toolchain install nightly --profile minimal
