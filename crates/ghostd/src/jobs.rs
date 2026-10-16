@@ -881,20 +881,25 @@ impl Jobs {
             if live.busy {
                 continue;
             }
-            let ended = live.status.as_ref().map_or(live.spec.created_at_ms, |s| {
-                s.ended_at_ms.unwrap_or(s.started_at_ms)
+            // Its retention starts when it finished, which for a job that
+            // kept what its program left can be long after the program's
+            // end (older status files: the program's end).
+            let finished_at = live.status.as_ref().map_or(live.spec.created_at_ms, |s| {
+                s.finished_at_ms
+                    .or(s.ended_at_ms)
+                    .unwrap_or(s.started_at_ms)
             });
-            finished.push((ended, live.spec.kind, dir));
+            finished.push((finished_at, live.spec.kind, dir));
         }
         let mut removed = 0;
-        finished.sort_by_key(|(ended, _, _)| *ended);
+        finished.sort_by_key(|(finished_at, _, _)| *finished_at);
         let mut kept = Vec::new();
-        for (ended, kind, dir) in finished {
+        for (finished_at, kind, dir) in finished {
             let hours = match kind {
                 Kind::Exec => self.config.exec_retention_hours,
                 Kind::Job => self.config.job_retention_hours,
             };
-            if now.saturating_sub(ended) >= hours.saturating_mul(3_600_000) {
+            if now.saturating_sub(finished_at) >= hours.saturating_mul(3_600_000) {
                 if fs::remove_dir_all(&dir).is_ok() {
                     removed += 1;
                     total -= 1;
@@ -1127,6 +1132,55 @@ mod tests {
         let last = jobs.log_read(id, Stream::Stdout, Some(0), 100).unwrap();
         assert!(last.ended);
         assert_eq!((last.total, last.data.as_slice()), (8, &b"one\ntwo\n"[..]));
+    }
+
+    /// A finished job's files: its program ended `ended_ago_min` minutes
+    /// ago, the job finished `finished_ago_min` ago (`None`: an older
+    /// status file that does not say).
+    fn finished_job(root: &Path, id: &str, ended_ago_min: u64, finished_ago_min: Option<u64>) {
+        let dir = root.join(id);
+        fs::create_dir(&dir).unwrap();
+        let ago = |min: u64| now_ms() - min * 60_000;
+        let spec = SpecFile {
+            kind: Kind::Job,
+            created_at_ms: ago(ended_ago_min + 1),
+            ..SpecFile::default()
+        };
+        fs::write(dir.join(SPEC), serde_json::to_vec(&spec).unwrap()).unwrap();
+        let status = StatusFile {
+            format: FORMAT,
+            state: State::Exited,
+            code: Some(0),
+            started_at_ms: ago(ended_ago_min + 1),
+            ended_at_ms: Some(ago(ended_ago_min)),
+            finished_at_ms: finished_ago_min.map(ago),
+            tree_gone: true,
+            ..StatusFile::default()
+        };
+        crate::jobfiles::write_status(&dir, &status, false).unwrap();
+    }
+
+    #[test]
+    fn gc_ages_a_job_from_when_it_finished() {
+        let root = tempfile::tempdir().unwrap();
+        let config = Config {
+            job_retention_hours: 2,
+            max_jobs_kept: 2,
+            ..Config::default()
+        };
+        let jobs = Jobs::new(root.path().to_path_buf(), config);
+        // A server its program left ran for three hours and just ended.
+        finished_job(root.path(), "j000000000000000a", 180, Some(1));
+        // An older status file: aged from the program's end.
+        finished_job(root.path(), "j000000000000000b", 180, None);
+        // Within the retention, but the oldest to finish of three kept.
+        finished_job(root.path(), "j000000000000000c", 100, Some(90));
+        finished_job(root.path(), "j000000000000000d", 30, Some(30));
+        let collected = jobs.gc();
+        assert_eq!(collected.removed, 2);
+        let mut left: Vec<String> = jobs.ids();
+        left.sort();
+        assert_eq!(left, ["j000000000000000a", "j000000000000000d"]);
     }
 
     #[test]

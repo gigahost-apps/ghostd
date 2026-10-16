@@ -162,6 +162,7 @@ pub fn run(dir: &Path) -> ExitCode {
         shim_start: procfs::start_time(me).unwrap_or(0),
         started_at_ms: now_ms(),
         ended_at_ms: None,
+        finished_at_ms: None,
         timed_out: false,
         tree_gone: false,
         processes: 0,
@@ -181,6 +182,7 @@ pub fn run(dir: &Path) -> ExitCode {
             status.state = State::FailedToStart;
             status.message = Some(format!("cannot start {program:?}: {e}"));
             status.ended_at_ms = Some(now_ms());
+            status.finished_at_ms = status.ended_at_ms;
             status.tree_gone = true;
             let _ = write_status(dir, &status, true);
             return ExitCode::SUCCESS;
@@ -545,10 +547,12 @@ impl Supervise<'_> {
     }
 
     /// Puts the end into the status: nothing left in the job's session,
-    /// and how many processes an Exec's end stopped.
+    /// when the job finished, and how many processes an Exec's end
+    /// stopped.
     fn finish(&self) {
         let mut status = self.shared.status();
         status.tree_gone = true;
+        status.finished_at_ms = Some(now_ms());
         status.processes = 0;
         status.stopped = self
             .leftovers

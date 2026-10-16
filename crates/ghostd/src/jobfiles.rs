@@ -117,7 +117,12 @@ pub struct StatusFile {
     /// The shim's start time from `/proc/<pid>/stat`, against pid reuse.
     pub shim_start: u64,
     pub started_at_ms: u64,
+    /// When the program ended.
     pub ended_at_ms: Option<u64>,
+    /// When the job finished (with `tree_gone`): a job keeps what its
+    /// program left, so this can be long after `ended_at_ms`. Older files
+    /// have none.
+    pub finished_at_ms: Option<u64>,
     pub timed_out: bool,
     /// Nothing is left in the job's session (processes that started a
     /// session of their own aside) and the logs are final: the job is
