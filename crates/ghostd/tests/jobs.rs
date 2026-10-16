@@ -9,7 +9,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use common::{Env, alive, exec, sh, signal, start, status, wait_gone, wait_job};
 use ghostd_client::Connection;
-use ghostd_protocol::v1::{ErrorKind, JobState, LogSlice, Request, Response, Stream};
+use ghostd_protocol::v1::{ErrorKind, JobInfo, JobState, LogSlice, Request, Response, Stream};
 
 async fn log(
     c: &Connection,
@@ -502,4 +502,151 @@ async fn a_job_whose_shim_runs_is_never_collected_even_without_a_status() {
     });
     assert!(dir.exists(), "a job whose shim runs was collected");
     assert_eq!(status(&c, &job).await.state, JobState::Running);
+}
+
+async fn wait_for_ms(c: &Connection, job: &str, timeout_ms: u64) -> JobInfo {
+    match c
+        .call(Request::JobWait {
+            job_id: job.into(),
+            timeout_ms,
+        })
+        .await
+        .unwrap()
+    {
+        Response::Job(info) => info,
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// Waits until the job's program has ended (the job may live on).
+async fn program_ended(c: &Connection, job: &str) -> JobInfo {
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let info = status(c, job).await;
+        if info.state != JobState::Running {
+            return info;
+        }
+        assert!(Instant::now() < until, "{info:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_background_process_belongs_to_the_job_until_it_is_stopped() {
+    let env = Env::new();
+    let c = env.connect().await;
+    let job = start(&c, sh("nohup sleep 301 >/dev/null 2>&1 & echo started")).await;
+    let info = program_ended(&c, &job).await;
+    assert_eq!(info.state, JobState::Exited { code: 0 });
+    // Well past any settle, the server is still the job's.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let info = status(&c, &job).await;
+    assert_eq!(info.state, JobState::Exited { code: 0 });
+    assert_eq!(info.processes, 1, "{info:?}");
+    assert!(!info.finished);
+    assert_eq!(env.processes("301").len(), 1);
+    // Listed as unfinished, not removable.
+    let Response::Jobs(jobs) = c
+        .call(Request::JobList {
+            include_finished: false,
+            limit: 0,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(jobs.iter().any(|j| j.job_id == job));
+    let e = c
+        .call(Request::JobRemove {
+            job_id: job.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(remote_kind(&e), ErrorKind::Busy);
+    // A log read does not call it ended.
+    let slice = log(&c, &job, Stream::Stdout, Some(0), 100).await;
+    assert!(!slice.ended);
+    // A short wait returns unfinished.
+    let begun = Instant::now();
+    let info = wait_for_ms(&c, &job, 300).await;
+    assert!(!info.finished);
+    assert!(begun.elapsed() >= Duration::from_millis(250));
+    let Response::Job(stopped) = c
+        .call(Request::JobStop {
+            job_id: job.clone(),
+            grace_ms: Some(300),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(stopped.finished, "{stopped:?}");
+    assert_eq!(stopped.processes, 0);
+    assert_eq!(stopped.state, JobState::Exited { code: 0 });
+    assert!(
+        env.processes("301").is_empty(),
+        "the server outlived the stop"
+    );
+    let begun = Instant::now();
+    assert!(wait_for_ms(&c, &job, 10_000).await.finished);
+    assert!(begun.elapsed() < Duration::from_secs(1));
+    let slice = log(&c, &job, Stream::Stdout, Some(0), 100).await;
+    assert!(slice.ended);
+    assert_eq!(slice.data, b"started\n");
+}
+
+#[tokio::test]
+async fn a_job_finishes_when_its_leftovers_end() {
+    let env = Env::new();
+    let c = env.connect().await;
+    let begun = Instant::now();
+    let job = start(&c, sh("sleep 1 &")).await;
+    let info = program_ended(&c, &job).await;
+    assert_eq!(info.state, JobState::Exited { code: 0 });
+    let info = wait_job(&c, &job).await;
+    assert!(info.finished);
+    let took = begun.elapsed();
+    assert!(took >= Duration::from_millis(950), "{took:?}");
+    assert!(took < Duration::from_secs(4), "{took:?}");
+    assert_eq!(info.processes, 0);
+}
+
+#[tokio::test]
+async fn a_detached_process_is_not_waited_for() {
+    let env = Env::new();
+    let c = env.connect().await;
+    let job = start(
+        &c,
+        sh("setsid sleep 302 >/dev/null 2>&1 </dev/null & echo $!"),
+    )
+    .await;
+    let begun = Instant::now();
+    let info = wait_job(&c, &job).await;
+    assert!(info.finished);
+    assert_eq!(info.state, JobState::Exited { code: 0 });
+    assert!(
+        begun.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        begun.elapsed()
+    );
+    let out = log(&c, &job, Stream::Stdout, Some(0), 100).await;
+    let pid: u32 = String::from_utf8(out.data).unwrap().trim().parse().unwrap();
+    assert!(alive(pid), "the detached process was killed");
+    signal(pid, 9);
+    wait_gone(pid);
+}
+
+#[tokio::test]
+async fn a_job_timeout_takes_what_the_program_left() {
+    let env = Env::new();
+    let c = env.connect().await;
+    let mut spec = sh("sleep 303 >/dev/null 2>&1 &");
+    spec.timeout_ms = Some(700);
+    let job = start(&c, spec).await;
+    let info = wait_job(&c, &job).await;
+    assert!(info.finished);
+    assert_eq!(info.state, JobState::Exited { code: 0 });
+    assert!(env.processes("303").is_empty());
 }

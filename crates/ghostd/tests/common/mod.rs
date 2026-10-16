@@ -11,7 +11,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use ghostd_client::{Connection, Options};
-use ghostd_protocol::v1::{ExecResult, ExecSpec, JobInfo, JobState, Program, Request, Response};
+use ghostd_protocol::v1::{ExecResult, ExecSpec, JobInfo, Program, Request, Response};
 use ghostd_protocol::{
     ClientHello, FrameDecoder, HelloAnswer, MarkerScan, MarkerScanner, ServerHello, decode,
     encode_frame,
@@ -242,7 +242,7 @@ pub async fn wait_job(c: &Connection, job_id: &str) -> JobInfo {
             Response::Job(info) => info,
             other => panic!("unexpected {other:?}"),
         };
-        if info.state != JobState::Running {
+        if info.finished {
             return info;
         }
     }

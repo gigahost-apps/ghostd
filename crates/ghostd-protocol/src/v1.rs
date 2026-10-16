@@ -107,7 +107,8 @@ pub enum Request {
     Exec(ExecSpec),
     /// Starts a program as a job and answers its ID at once.
     JobStart(ExecSpec),
-    /// The jobs, newest first. `limit` 0 means 100.
+    /// The jobs, newest first. `limit` 0 means 100. Without
+    /// `include_finished`, only the jobs not [`JobInfo::finished`].
     JobList {
         include_finished: bool,
         limit: u32,
@@ -115,7 +116,8 @@ pub enum Request {
     JobStatus {
         job_id: String,
     },
-    /// Waits for the job to end, at most `timeout_ms` (capped at 60 s).
+    /// Waits for the job to be [`JobInfo::finished`], at most `timeout_ms`
+    /// (capped at 60 s).
     JobWait {
         job_id: String,
         timeout_ms: u64,
@@ -138,7 +140,7 @@ pub enum Request {
         job_id: String,
         grace_ms: Option<u64>,
     },
-    /// Removes a finished job and its logs.
+    /// Removes a [`JobInfo::finished`] job and its logs (`Busy` before).
     JobRemove {
         job_id: String,
     },
@@ -300,6 +302,12 @@ pub struct ExecResult {
     pub stdout: Output,
     pub stderr: Output,
     pub duration_ms: u64,
+    /// How many processes the program left in the job's session were
+    /// stopped after it ended by itself (0 normally). A plain background
+    /// process (`cmd &`, `nohup cmd &`) does not outlive an Exec: start it
+    /// with [`Request::JobStart`], or detach it into a session of its own
+    /// (`setsid`, a daemon's own forking), which is left running.
+    pub stopped: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -337,6 +345,8 @@ pub enum Stream {
     Stderr,
 }
 
+/// The state of a job's program (not of what it left running: see
+/// [`JobInfo::finished`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum JobState {
     Running,
@@ -362,6 +372,15 @@ pub struct JobInfo {
     pub stdout_total: u64,
     pub stderr_total: u64,
     pub pid: Option<u32>,
+    /// The processes still in the job's session, the program included
+    /// (0 once finished). A job lives as long as any is left: what the
+    /// program leaves in the background when it ends belongs to the job.
+    pub processes: u32,
+    /// Nothing is left in the job's session and the final state is
+    /// written (or the job is [`JobState::Lost`]). `state` is the
+    /// program's: it can be `Exited` while the job is not finished yet.
+    /// Processes that started a session of their own are not waited for.
+    pub finished: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -373,7 +392,7 @@ pub struct LogSlice {
     pub total: u64,
     /// The lowest offset still kept (older bytes were rotated away).
     pub first_available: u64,
-    /// The job has ended and `total` is final.
+    /// The job is [`JobInfo::finished`] and `total` is final.
     pub ended: bool,
 }
 

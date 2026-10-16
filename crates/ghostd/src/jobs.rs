@@ -20,10 +20,11 @@ use sha2::{Digest, Sha256};
 
 use crate::config::{Config, MAX_EXEC_TIMEOUT_MS, MAX_OUTPUT_CAP};
 use crate::jobfiles::{
-    FORMAT, Kind, LOG_LOCK, SCRIPT, SPEC, STATUS, STDIN, STOP, SpecFile, State, StatusFile,
-    log_name, read_spec, read_status, read_status_checked, rotated_name,
+    FORMAT, Kind, LOG_LOCK, RULE_JOB, SCRIPT, SPEC, STATUS, STDIN, STOP, SpecFile, State,
+    StatusFile, claim_rule, log_name, read_spec, read_status, read_status_checked, rotated_name,
 };
 use crate::procfs;
+use crate::shim::SETTLE;
 use crate::util::{B64, atomic_write, err, io_error, now_ms, random_hex, resolve};
 
 /// How long a `JobWait` may wait.
@@ -192,6 +193,13 @@ impl Jobs {
             stdout_total: status.map_or(0, |s| s.stdout.total),
             stderr_total: status.map_or(0, |s| s.stderr.total),
             pid: status.and_then(|s| s.pid),
+            processes: match status {
+                _ if !live.busy => 0,
+                Some(s) => s.processes,
+                // Starting: the program is about to run.
+                None => 1,
+            },
+            finished: !live.busy,
         }
     }
 
@@ -229,7 +237,7 @@ impl Jobs {
                 let live = Self::live(&self.root.join(&id)).ok()?;
                 Some(Self::info_of(&id, &live))
             })
-            .filter(|info| include_finished || info.state == JobState::Running)
+            .filter(|info| include_finished || !info.finished)
             .collect();
         jobs.sort_by(|a, b| {
             b.started_at_ms
@@ -552,6 +560,7 @@ impl Jobs {
                     stdout: Output::default(),
                     stderr: Output::default(),
                     duration_ms: 0,
+                    stopped: 0,
                 });
             }
             Err(StartError::Other(e)) => return Err(e),
@@ -572,32 +581,56 @@ impl Jobs {
         // When the shim kills it at the timeout, allow it the grace and a
         // margin before answering without a final state.
         let last = deadline + Duration::from_millis(file.stop_grace_ms) + Duration::from_secs(10);
+        // Once the program ended, the shim stops what it left in the job's
+        // session (after the settle and the grace): the answer waits for
+        // that, so no process of the Exec outlives it.
+        let mut ended_seen: Option<Instant> = None;
         let outcome = loop {
             let d = dir.clone();
             let live =
                 blocking(move || Self::live(&d).map_err(|e| io_error(&e, "reading the job")))
                     .await?;
             let status = live.status.as_ref();
+            let now = Instant::now();
+            if keep && live.busy && now >= deadline {
+                // Make it a job, unless the shim saw its program end first
+                // (a repeat of the request finds the rule set before).
+                let d = dir.clone();
+                let claimed = blocking(move || {
+                    claim_rule(&d, RULE_JOB).map_err(|e| io_error(&e, "writing the rule"))
+                })
+                .await;
+                match claimed {
+                    Ok(None) => break Outcome::TimedOut { killed: false },
+                    Ok(Some(rule)) if rule == RULE_JOB => {
+                        break Outcome::TimedOut { killed: false };
+                    }
+                    Err(_) if now >= last => break Outcome::TimedOut { killed: false },
+                    // It ended as an Exec (wait for its end), or the rule
+                    // could not be written yet.
+                    Ok(Some(_)) | Err(_) => {}
+                }
+            }
             match (Self::state(&live), status) {
                 (JobState::Running, _) => {
-                    let now = Instant::now();
-                    if (keep && now >= deadline) || now >= last {
+                    if now >= last {
                         break Outcome::TimedOut { killed: false };
                     }
                 }
-                (JobState::Exited { code }, Some(s)) => {
-                    break if s.timed_out {
-                        Outcome::TimedOut { killed: true }
-                    } else {
-                        Outcome::Exited { code }
-                    };
-                }
-                (JobState::Signaled { signal }, Some(s)) => {
-                    break if s.timed_out {
-                        Outcome::TimedOut { killed: true }
-                    } else {
-                        Outcome::Signaled { signal }
-                    };
+                (state @ (JobState::Exited { .. } | JobState::Signaled { .. }), Some(s)) => {
+                    let seen = *ended_seen.get_or_insert(now);
+                    let bound = seen
+                        + SETTLE
+                        + Duration::from_millis(file.stop_grace_ms)
+                        + Duration::from_secs(10);
+                    if !live.busy || now >= bound {
+                        break match state {
+                            _ if s.timed_out => Outcome::TimedOut { killed: true },
+                            JobState::Exited { code } => Outcome::Exited { code },
+                            JobState::Signaled { signal } => Outcome::Signaled { signal },
+                            _ => unreachable!(),
+                        };
+                    }
                 }
                 _ => {
                     return Err(err(
@@ -651,10 +684,12 @@ impl Jobs {
             stdout,
             stderr,
             duration_ms,
+            stopped: status.as_ref().map_or(0, |s| s.stopped),
         })
     }
 
-    /// Waits up to `timeout_ms` (at most 60 s) for the job to end.
+    /// Waits up to `timeout_ms` (at most 60 s) for the job to be finished:
+    /// its program ended and nothing left in its session.
     ///
     /// # Errors
     ///
@@ -665,7 +700,7 @@ impl Jobs {
             let this = Arc::clone(self);
             let i = id.clone();
             let info = blocking(move || this.info(&i)).await?;
-            if info.state != JobState::Running || Instant::now() >= until {
+            if info.finished || Instant::now() >= until {
                 return Ok(info);
             }
             tokio::time::sleep(POLL.min(until.saturating_duration_since(Instant::now()))).await;

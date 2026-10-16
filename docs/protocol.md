@@ -118,29 +118,44 @@ process below the shim, waits the grace, then SIGKILLs what remains until
 nothing below the shim is left, including processes that left the group or
 started their own session.
 
-When the program ends by itself, what it left in the job's session
-(background processes, `nohup`, double forks) is stopped the same way half
-a second later, while a process that started a session of its own is left
-running: daemons detach that way (`setsid`, `start-stop-daemon
---background`, `pg_ctl start`, a forking `nginx`, `redis-server
---daemonize yes`, `tmux new -d`, `screen -dm`), so that `rc-service nginx
-start` or `pg_ctl start` works as an `Exec`. A detached process is then
-init's, not the job's; it should not keep the job's stdout or stderr open
-(daemons redirect them), since nothing reads them once the shim is gone.
-To keep a process that is not a daemon running, start it as a job.
+No process is leaked. When the program ends by itself, what it left in
+the job's session (background processes, `cmd &`, `nohup cmd &`, double
+forks) depends on how it was started:
+
+- `Exec`: they are stopped the same way half a second later, before the
+  answer, and `ExecResult.stopped` counts them (0 normally). A plain
+  background process does not outlive an `Exec`.
+- `JobStart`: they belong to the job. The job lives as long as anything is
+  left in its session; it finishes when none is left, or by `JobStop` or
+  its timeout, which take the whole tree. So `JobStart(["sh", "-c",
+  "nohup srv >log 2>&1 &"])` keeps `srv` as part of the job and `JobStop`
+  stops it. `JobInfo.state` is the program's (`Exited` once it ended),
+  `processes` counts what is left in the session and `finished` says the
+  job is over. An `Exec` with `keep_on_timeout` answered at its timeout
+  follows this rule from then on.
+
+Either way a process that started a session of its own is left running
+and is not waited for: daemons detach that way (`setsid`,
+`start-stop-daemon --background`, `pg_ctl start`, a forking `nginx`,
+`redis-server --daemonize yes`, `tmux new -d`, `screen -dm`), so that
+`rc-service nginx start` or `pg_ctl start` works as an `Exec`. A detached
+process is then init's, not the job's; it should not keep the job's stdout
+or stderr open (daemons redirect them), since nothing reads them once the
+shim is gone. A service started with `systemctl start` is systemd's child,
+not the job's, so it runs on either way.
 
 | Request | Answer | Notes |
 |---|---|---|
 | `Ping` | `Pong` | |
-| `Exec(ExecSpec)` | `Exec(ExecResult)` | Runs to the end or `timeout_ms` (default 120 s, at most a day). `ExecResult { job_id, outcome, stdout, stderr, duration_ms }`; `outcome` `Exited { code }`, `Signaled { signal }`, `TimedOut { killed }` or `FailedToStart { message }`. Each `Output { data, offset, total }` holds the last `output_cap` bytes (default 256 KiB, at most 8 MiB); `offset > 0` means the earlier bytes are in the job's log. `keep_on_timeout` leaves the program running as job `job_id` (`killed: false`). After `FailedToStart` no job is kept and `job_id` is empty. |
+| `Exec(ExecSpec)` | `Exec(ExecResult)` | Runs to the end or `timeout_ms` (default 120 s, at most a day). `ExecResult { job_id, outcome, stdout, stderr, duration_ms, stopped }`; `outcome` `Exited { code }`, `Signaled { signal }`, `TimedOut { killed }` or `FailedToStart { message }`. Each `Output { data, offset, total }` holds the last `output_cap` bytes (default 256 KiB, at most 8 MiB); `offset > 0` means the earlier bytes are in the job's log. `keep_on_timeout` leaves the program running as job `job_id` (`killed: false`). After `FailedToStart` no job is kept and `job_id` is empty. `stopped`: how many processes the program left in its session were stopped after it ended (see above). |
 | `JobStart(ExecSpec)` | `JobStarted { job_id }` | `timeout_ms` (default none) stops the job; `output_cap` and `keep_on_timeout` do not apply. |
-| `JobList { include_finished, limit }` | `Jobs([JobInfo])` | Newest first; `limit` 0 means 100. |
-| `JobStatus { job_id }` | `Job(JobInfo)` | `JobInfo { job_id, name, argv_summary, state, started_at_ms, ended_at_ms, stdout_total, stderr_total, pid }`, `state` `Running`, `Exited { code }`, `Signaled { signal }` or `Lost` (its shim vanished; nothing is killed for it). |
-| `JobWait { job_id, timeout_ms }` | `Job(JobInfo)` | When it ends, or at the timeout (at most 60 s) with `Running`. |
-| `JobLogRead { job_id, stream, offset, max_len }` | `LogSlice { data, offset, total, first_available, ended }` | `offset` `None` reads the last `max_len` bytes. Logs rotate per stream at `log_max_bytes`, one rotated file kept; `first_available` is the lowest offset still kept. `ended`: `total` is final. |
+| `JobList { include_finished, limit }` | `Jobs([JobInfo])` | Newest first; `limit` 0 means 100. Without `include_finished`, the jobs not `finished`. |
+| `JobStatus { job_id }` | `Job(JobInfo)` | `JobInfo { job_id, name, argv_summary, state, started_at_ms, ended_at_ms, stdout_total, stderr_total, pid, processes, finished }`, `state` the program's: `Running`, `Exited { code }`, `Signaled { signal }` or `Lost` (its shim vanished; nothing is killed for it). `processes`: the processes still in the job's session, the program included (0 once finished). `finished`: none is left and the final state is written (also for `Lost`). |
+| `JobWait { job_id, timeout_ms }` | `Job(JobInfo)` | When it is `finished`, or at the timeout (at most 60 s) with `finished: false`. |
+| `JobLogRead { job_id, stream, offset, max_len }` | `LogSlice { data, offset, total, first_available, ended }` | `offset` `None` reads the last `max_len` bytes. Logs rotate per stream at `log_max_bytes`, one rotated file kept; `first_available` is the lowest offset still kept. `ended`: the job is `finished` and `total` is final. |
 | `JobSignal { job_id, signal }` | `Done` | To the program's process group; `Conflict` when it has ended. |
 | `JobStop { job_id, grace_ms }` | `Job(JobInfo)` | Answers once everything the job started is gone. |
-| `JobRemove { job_id }` | `Done` | `Busy` while it runs. |
+| `JobRemove { job_id }` | `Done` | `Busy` until it is `finished`. |
 
 ### Retries
 

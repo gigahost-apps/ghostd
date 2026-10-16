@@ -9,12 +9,21 @@
 //! nothing below it is left. The worker can die at any time: the shim does
 //! not depend on it.
 //!
-//! When the program ends by itself, the shim stops what it left in the
-//! job's session (background processes, `nohup`, double forks) the same
-//! way, after [`SETTLE`], but leaves the processes that started a session
-//! of their own: daemons (`setsid`, `start-stop-daemon --background`,
-//! `pg_ctl start`, `nginx`, `tmux new -d`) are what a program that exits
-//! leaves running on purpose. The shim then exits and they go to init.
+//! When the program ends by itself, what it left in the job's session
+//! (background processes, `nohup`, double forks) depends on the kind:
+//!
+//! - An Exec leaks no process: the shim stops them the same way, after
+//!   [`SETTLE`], and counts them in `stopped`.
+//! - A job keeps them: it lives on until none is left in its session (or
+//!   a stop or its timeout takes the whole tree), so a server started in
+//!   the background is part of the job.
+//!
+//! Either way the processes that started a session of their own are left:
+//! daemons (`setsid`, `start-stop-daemon --background`, `pg_ctl start`,
+//! `nginx`, `tmux new -d`) are what a program leaves running on purpose.
+//! They are not waited for; when the shim exits they go to init. An Exec
+//! with `keep_on_timeout` answered at its timeout follows the job rule from
+//! then on (see [`jobfiles::claim_rule`]).
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -41,8 +50,8 @@ use signal_hook::consts::{SIGCHLD, SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 use crate::jobfiles::{
-    self, FORMAT, LOG_LOCK, STDIN, STOP, SpecFile, State, StatusFile, StreamStatus, log_name,
-    rotated_name, write_status,
+    self, FORMAT, Kind, LOG_LOCK, RULE_EXEC, STDIN, STOP, SpecFile, State, StatusFile,
+    StreamStatus, log_name, rotated_name, write_status,
 };
 use crate::procfs;
 use crate::util::now_ms;
@@ -78,6 +87,38 @@ impl Shared {
 /// to detach (a daemon forks, then its child calls `setsid`) before the
 /// rest of the job's session is stopped.
 pub const SETTLE: Duration = Duration::from_millis(500);
+
+/// How often the shim counts the job's processes while nothing is being
+/// stopped (each count reads `/proc`).
+const COUNT_EVERY: Duration = Duration::from_secs(1);
+
+/// How soon after a child's end (SIGCHLD) the shim counts again, while it
+/// waits for what a job's program left: the last one ending finishes the
+/// job.
+const COUNT_AFTER_CHILD: Duration = Duration::from_millis(50);
+
+/// What happens to what the program leaves in the job's session when it
+/// ends by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rule {
+    /// Stopped (an Exec).
+    Stop,
+    /// Waited for (a job).
+    Wait,
+    /// An Exec with `keep_on_timeout`: decided when the program ends.
+    Undecided,
+}
+
+/// Decides an Exec with `keep_on_timeout` when its program ends: an Exec
+/// unless the worker made it a job at its timeout first. When the rule
+/// cannot be claimed or read, nothing is stopped.
+fn decide(dir: &Path) -> Rule {
+    match jobfiles::claim_rule(dir, RULE_EXEC) {
+        Ok(None) => Rule::Stop,
+        Ok(Some(rule)) if rule == RULE_EXEC => Rule::Stop,
+        _ => Rule::Wait,
+    }
+}
 
 fn pid_of(raw: u32) -> Pid {
     Pid::from_raw(i32::try_from(raw).unwrap_or(i32::MAX))
@@ -123,6 +164,8 @@ pub fn run(dir: &Path) -> ExitCode {
         ended_at_ms: None,
         timed_out: false,
         tree_gone: false,
+        processes: 0,
+        stopped: 0,
         stdout: StreamStatus::default(),
         stderr: StreamStatus::default(),
         log_error: None,
@@ -151,6 +194,7 @@ pub fn run(dir: &Path) -> ExitCode {
     }
     status.pid = Some(program);
     status.pgid = Some(program);
+    status.processes = 1;
     status.started_at_ms = now_ms();
     let shared = Arc::new(Shared {
         dir: dir.to_path_buf(),
@@ -178,6 +222,11 @@ pub fn run(dir: &Path) -> ExitCode {
     } else {
         None
     };
+    let mut rule = match (spec.kind, spec.kill_on_timeout) {
+        (Kind::Job, _) => Rule::Wait,
+        (Kind::Exec, true) => Rule::Stop,
+        (Kind::Exec, false) => Rule::Undecided,
+    };
     let mut supervise = Supervise {
         shared: &shared,
         me,
@@ -187,6 +236,15 @@ pub fn run(dir: &Path) -> ExitCode {
         exit: None,
         stop: None,
         leftovers: None,
+        count: Count {
+            next: Instant::now(),
+            at: Instant::now(),
+            child_ended: false,
+            last: Progress {
+                below: 1,
+                waiting: 1,
+            },
+        },
     };
     let mut exit_seen: Option<Instant> = None;
     let mut final_written = false;
@@ -199,8 +257,15 @@ pub fn run(dir: &Path) -> ExitCode {
         } else {
             Duration::from_millis(250)
         };
+        if supervise.count.child_ended {
+            wait = wait.min(COUNT_AFTER_CHILD);
+        }
+        // A job's timeout holds while anything is left of it; an Exec's
+        // while its program runs (its leftovers are stopped anyway).
+        let timing = supervise.program_alive || rule == Rule::Wait;
         if let Some(d) = deadline
-            && supervise.program_alive
+            && timing
+            && supervise.stop.is_none()
         {
             wait = wait.min(d.saturating_duration_since(Instant::now()));
         }
@@ -213,6 +278,13 @@ pub fn run(dir: &Path) -> ExitCode {
                     supervise.begin_stop(grace);
                 }
             }
+            // While the program runs, its children's ends change nothing
+            // we wait for (its own end is seen by the reap below).
+            Ok(Event::Signal(SIGCHLD)) => {
+                if !supervise.program_alive {
+                    supervise.count.child_ended = true;
+                }
+            }
             Ok(Event::PipeClosed) => pipes_open -= 1,
             Ok(Event::Signal(_)) | Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => pipes_open = 0,
@@ -221,18 +293,26 @@ pub fn run(dir: &Path) -> ExitCode {
         if !supervise.program_alive && exit_seen.is_none() {
             let now = Instant::now();
             exit_seen = Some(now);
+            // Count again at once: the program is gone.
+            supervise.count.next = now;
             if supervise.stop.is_none() {
-                // It ended by itself: what it left in its session is
-                // stopped after the settle, daemons are left.
-                supervise.leftovers = Some(Leftovers {
-                    settle_until: now + SETTLE,
-                    grace_ms: spec.stop_grace_ms,
-                    stop: None,
-                });
+                if rule == Rule::Undecided {
+                    rule = decide(dir);
+                }
+                if rule == Rule::Stop {
+                    // An Exec leaks nothing: what it left in its session
+                    // is stopped after the settle, daemons are left.
+                    supervise.leftovers = Some(Leftovers {
+                        settle_until: now + SETTLE,
+                        grace_ms: spec.stop_grace_ms,
+                        stop: None,
+                    });
+                }
             }
         }
+        let timing = supervise.program_alive || rule == Rule::Wait;
         if let Some(d) = deadline
-            && supervise.program_alive
+            && timing
             && supervise.stop.is_none()
             && Instant::now() >= d
         {
@@ -254,7 +334,7 @@ pub fn run(dir: &Path) -> ExitCode {
             supervise.apply_exit();
             if progress.waiting == 0 && pipes_open == 0 {
                 // The usual case: nothing left to stop, one final write.
-                shared.status().tree_gone = true;
+                supervise.finish();
                 shared.write(true);
                 return ExitCode::SUCCESS;
             }
@@ -284,7 +364,7 @@ pub fn run(dir: &Path) -> ExitCode {
             Err(_) => break,
         }
     }
-    shared.status().tree_gone = true;
+    supervise.finish();
     shared.write(true);
     ExitCode::SUCCESS
 }
@@ -336,12 +416,22 @@ struct Leftovers {
 }
 
 /// Where a stop stands.
+#[derive(Debug, Clone, Copy)]
 struct Progress {
     /// Every process below us, the program included.
     below: usize,
     /// The processes we still wait for: everything during a stop, the
     /// program while it runs, what it left in its session after it ended.
     waiting: usize,
+}
+
+/// When the job's processes are counted while nothing is being stopped.
+struct Count {
+    next: Instant,
+    at: Instant,
+    /// A child ended since the last count.
+    child_ended: bool,
+    last: Progress,
 }
 
 struct Supervise<'a> {
@@ -357,8 +447,9 @@ struct Supervise<'a> {
     exit: Option<(State, Option<i32>, Option<i32>, u64)>,
     /// A stop of the whole tree (a `JobStop`, a timeout).
     stop: Option<StopState>,
-    /// The program ended by itself (and no stop came first).
+    /// The program of an Exec ended by itself (and no stop came first).
     leftovers: Option<Leftovers>,
+    count: Count,
 }
 
 impl Supervise<'_> {
@@ -420,13 +511,65 @@ impl Supervise<'_> {
         });
     }
 
+    /// The processes below us and the ones in the job's session. When
+    /// none is in the session, it looks again at once: a process that
+    /// forks and exits while `/proc` is read can hide its child from one
+    /// pass, never from the next.
+    fn scan(&self) -> (Vec<procfs::Descendant>, Vec<procfs::Descendant>) {
+        let mut pass = 0;
+        loop {
+            let descendants = procfs::descendants(self.me);
+            let in_session: Vec<procfs::Descendant> = descendants
+                .iter()
+                .copied()
+                .filter(|d| d.sid == self.session)
+                .collect();
+            pass += 1;
+            if !in_session.is_empty() || pass == 2 {
+                return (descendants, in_session);
+            }
+        }
+    }
+
+    /// Records how many processes are in the job's session: the ones
+    /// found there, and the program while it runs (also before it is
+    /// seen, as a zombie not yet reaped).
+    fn record(&self, in_session: &[procfs::Descendant]) {
+        let program = self.program_alive && !in_session.iter().any(|d| d.pid == self.program);
+        let count = u32::try_from(in_session.len() + usize::from(program)).unwrap_or(u32::MAX);
+        let mut status = self.shared.status();
+        if status.processes != count {
+            status.processes = count;
+            self.shared.dirty.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Puts the end into the status: nothing left in the job's session,
+    /// and how many processes an Exec's end stopped.
+    fn finish(&self) {
+        let mut status = self.shared.status();
+        status.tree_gone = true;
+        status.processes = 0;
+        status.stopped = self
+            .leftovers
+            .as_ref()
+            .and_then(|l| l.stop.as_ref())
+            .map_or(0, |s| u32::try_from(s.termed.len()).unwrap_or(u32::MAX));
+    }
+
     /// Signals what appeared since and, past the grace, SIGKILLs all that
-    /// is left: everything below us during a stop, what the program left
-    /// in the job's session after it ended by itself.
+    /// is left: everything below us during a stop, what an Exec's program
+    /// left in the job's session after it ended by itself. Otherwise counts
+    /// the job's processes now and then: while the program runs, and while
+    /// a job waits for what its program left.
     fn progress(&mut self) -> Progress {
         let program = usize::from(self.program_alive);
-        if let Some(stop) = &mut self.stop {
-            let descendants = procfs::descendants(self.me);
+        if self.stop.is_some() {
+            let (descendants, in_session) = self.scan();
+            self.record(&in_session);
+            let Some(stop) = &mut self.stop else {
+                unreachable!()
+            };
             let killing = Instant::now() >= stop.kill_at;
             if killing && self.program_alive {
                 let _ = killpg(pid_of(self.program), Signal::SIGKILL);
@@ -438,33 +581,58 @@ impl Supervise<'_> {
                 waiting: below,
             };
         }
-        let Some(leftovers) = &mut self.leftovers else {
-            return Progress {
-                below: program,
-                waiting: program,
+        if self.leftovers.is_some() {
+            let (descendants, in_session) = self.scan();
+            self.record(&in_session);
+            let Some(leftovers) = &mut self.leftovers else {
+                unreachable!()
             };
-        };
-        let descendants = procfs::descendants(self.me);
-        // A process that started a session of its own left on purpose.
-        let in_session: Vec<procfs::Descendant> = descendants
-            .iter()
-            .copied()
-            .filter(|d| d.sid == self.session)
-            .collect();
+            let now = Instant::now();
+            if !in_session.is_empty() && now >= leftovers.settle_until {
+                let grace = Duration::from_millis(leftovers.grace_ms);
+                let stop = leftovers.stop.get_or_insert_with(|| StopState {
+                    kill_at: now + grace,
+                    termed: HashSet::new(),
+                });
+                let killing = now >= stop.kill_at;
+                signal_all(stop, &in_session, killing);
+            }
+            return Progress {
+                below: descendants.len(),
+                waiting: in_session.len(),
+            };
+        }
+        // Nothing to stop: count now and then, and soon after a child
+        // ended while a job's program is gone (the last one ending
+        // finishes the job).
         let now = Instant::now();
-        if !in_session.is_empty() && now >= leftovers.settle_until {
-            let grace = Duration::from_millis(leftovers.grace_ms);
-            let stop = leftovers.stop.get_or_insert_with(|| StopState {
-                kill_at: now + grace,
-                termed: HashSet::new(),
-            });
-            let killing = now >= stop.kill_at;
-            signal_all(stop, &in_session, killing);
+        let due = now >= self.count.next
+            || (!self.program_alive
+                && self.count.child_ended
+                && now >= self.count.at + COUNT_AFTER_CHILD);
+        if due {
+            let (descendants, in_session) = self.scan();
+            self.record(&in_session);
+            self.count.child_ended = false;
+            self.count.at = now;
+            self.count.next = now + COUNT_EVERY;
+            let in_session_count = in_session.len()
+                + usize::from(
+                    self.program_alive && !in_session.iter().any(|d| d.pid == self.program),
+                );
+            self.count.last = Progress {
+                below: descendants.len() + program,
+                waiting: in_session_count,
+            };
         }
-        Progress {
-            below: descendants.len(),
-            waiting: in_session.len(),
+        if self.program_alive {
+            // While it runs, the program is what we wait for.
+            return Progress {
+                below: self.count.last.below.max(1),
+                waiting: self.count.last.waiting.max(1),
+            };
         }
+        self.count.last
     }
 }
 
@@ -473,6 +641,7 @@ impl Supervise<'_> {
 fn signal_all(stop: &mut StopState, targets: &[procfs::Descendant], killing: bool) {
     for d in targets {
         if killing {
+            stop.termed.insert(d.pid);
             let _ = kill(pid_of(d.pid), Signal::SIGKILL);
         } else if stop.termed.insert(d.pid) {
             let _ = kill(pid_of(d.pid), Signal::SIGTERM);

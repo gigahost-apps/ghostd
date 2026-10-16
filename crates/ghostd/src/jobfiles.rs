@@ -4,7 +4,9 @@
 //! when given, `status.json` (written by the shim, atomically),
 //! `stdout.log` / `stderr.log` and one rotated `.1` each, `log.lock` (held
 //! exclusively by the shim while it rotates, shared by readers while they
-//! open the logs) and `stop` (the grace a stop asks for).
+//! open the logs), `stop` (the grace a stop asks for) and `rule` (for an
+//! Exec with `keep_on_timeout`: whether it ended as an Exec or became a
+//! job, claimed once by whoever decides first, see [`claim_rule`]).
 //!
 //! Jobs outlive the binary that started them (an update, a rollback), so
 //! one ghostd reads the files of a newer or an older one: readers ignore
@@ -29,6 +31,13 @@ pub const STDIN: &str = "stdin";
 pub const SCRIPT: &str = "script";
 pub const STOP: &str = "stop";
 pub const LOG_LOCK: &str = "log.lock";
+pub const RULE: &str = "rule";
+/// The [`RULE`] of an Exec whose program ended before its timeout: what
+/// it left in the job's session is stopped.
+pub const RULE_EXEC: &str = "exec";
+/// The [`RULE`] of an Exec answered at its timeout with the program still
+/// running: from then on it is a job, and what it leaves is its own.
+pub const RULE_JOB: &str = "job";
 
 /// The format of `spec.json` and `status.json` this build writes.
 pub const FORMAT: u32 = 1;
@@ -110,8 +119,16 @@ pub struct StatusFile {
     pub started_at_ms: u64,
     pub ended_at_ms: Option<u64>,
     pub timed_out: bool,
-    /// Everything the program started is gone and the logs are final.
+    /// Nothing is left in the job's session (processes that started a
+    /// session of their own aside) and the logs are final: the job is
+    /// finished.
     pub tree_gone: bool,
+    /// The processes in the job's session below the shim, the program
+    /// included, as the shim last counted them (0 when finished).
+    pub processes: u32,
+    /// How many processes the program left in the job's session the shim
+    /// stopped after it ended by itself (an Exec's leftovers).
+    pub stopped: u32,
     pub stdout: StreamStatus,
     pub stderr: StreamStatus,
     pub log_error: Option<String>,
@@ -192,6 +209,34 @@ pub fn write_status(dir: &Path, status: &StatusFile, sync: bool) -> io::Result<(
     atomic_write(&dir.join(STATUS), &bytes, 0o600, sync)
 }
 
+/// Claims the [`RULE`] of an Exec with `keep_on_timeout`, atomically:
+/// `Ok(None)` when this call set it to `rule`, `Ok(Some(other))` with the
+/// rule another claim set first.
+///
+/// # Errors
+///
+/// When the file can be neither created nor read.
+pub fn claim_rule(dir: &Path, rule: &str) -> io::Result<Option<String>> {
+    let path = dir.join(RULE);
+    let temp = dir.join(format!(
+        ".{RULE}.{}.{}",
+        std::process::id(),
+        crate::util::now_ms()
+    ));
+    fs::write(&temp, rule)?;
+    // A hard link never replaces an existing file: the first claim wins,
+    // and the file is complete before its name appears.
+    let linked = fs::hard_link(&temp, &path);
+    let _ = fs::remove_file(&temp);
+    match linked {
+        Ok(()) => Ok(None),
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
+            Ok(Some(fs::read_to_string(&path)?.trim().to_string()))
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Reads `spec.json`.
 ///
 /// # Errors
@@ -245,5 +290,21 @@ mod tests {
         assert!(read_status_checked(dir.path()).is_err());
         fs::remove_file(dir.path().join(STATUS)).unwrap();
         assert!(read_status_checked(dir.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn the_first_rule_claim_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(claim_rule(dir.path(), RULE_JOB).unwrap(), None);
+        assert_eq!(
+            claim_rule(dir.path(), RULE_EXEC).unwrap().as_deref(),
+            Some(RULE_JOB)
+        );
+        assert_eq!(
+            claim_rule(dir.path(), RULE_JOB).unwrap().as_deref(),
+            Some(RULE_JOB)
+        );
+        // No temp file is left.
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 }

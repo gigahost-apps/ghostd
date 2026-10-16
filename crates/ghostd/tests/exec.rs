@@ -292,15 +292,77 @@ async fn a_daemon_outlives_a_normal_exit_and_the_rest_is_stopped() {
     )
     .await;
     assert_eq!(r.outcome, Outcome::Exited { code: 0 }, "{r:?}");
-    let text = String::from_utf8(r.stdout.data).unwrap();
+    let text = String::from_utf8(r.stdout.data.clone()).unwrap();
     let pids: Vec<u32> = text.lines().filter_map(|l| l.parse().ok()).collect();
     assert_eq!(pids.len(), 2, "{text}");
     let (daemon, leftover) = (pids[0], pids[1]);
-    // The shim stops what was left in the session, then exits.
-    wait_gone(leftover);
+    // The answer came after the shim stopped what was left in the
+    // session: no process of the Exec outlives it.
+    assert_eq!(r.stopped, 1, "{r:?}");
+    assert!(
+        !common::alive(leftover),
+        "the background sleep outlived the Exec"
+    );
     env.wait_for("the shim to exit", || env.processes("shim").is_empty());
     assert!(common::alive(daemon), "the detached daemon was killed");
     let info = wait_job(&c, &r.job_id).await;
     assert_eq!(info.state, JobState::Exited { code: 0 });
+    assert!(info.finished);
+    assert_eq!(info.processes, 0);
     common::signal(daemon, 9);
+}
+
+#[tokio::test]
+async fn a_plain_exit_stops_nothing() {
+    let env = Env::new();
+    let c = env.connect().await;
+    let r = exec(&c, sh("echo hi")).await;
+    assert_eq!(r.outcome, Outcome::Exited { code: 0 });
+    assert_eq!(r.stopped, 0);
+}
+
+#[tokio::test]
+async fn a_kept_exec_keeps_what_it_starts_later() {
+    let env = Env::new();
+    let c = env.connect().await;
+    // It is still running at the timeout, so it becomes a job; what it
+    // starts in the background afterwards is the job's.
+    let mut spec = sh("sleep 0.6; sleep 305 >/dev/null 2>&1 & echo started");
+    spec.timeout_ms = Some(200);
+    spec.keep_on_timeout = true;
+    let r = exec(&c, spec).await;
+    assert_eq!(r.outcome, Outcome::TimedOut { killed: false }, "{r:?}");
+    env.wait_for("the background sleep", || env.processes("305").len() == 1);
+    let job = r.job_id.clone();
+    let mut info = common::status(&c, &job).await;
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while info.state == JobState::Running {
+        assert!(std::time::Instant::now() < until);
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        info = common::status(&c, &job).await;
+    }
+    assert_eq!(info.state, JobState::Exited { code: 0 });
+    // Past the settle, the background sleep still runs as part of the job.
+    tokio::time::sleep(shim_settle() * 2).await;
+    let info = common::status(&c, &job).await;
+    assert!(!info.finished, "{info:?}");
+    assert_eq!(info.processes, 1, "{info:?}");
+    assert_eq!(env.processes("305").len(), 1);
+    let Response::Job(stopped) = c
+        .call(Request::JobStop {
+            job_id: job,
+            grace_ms: Some(300),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert!(stopped.finished);
+    assert!(env.processes("305").is_empty());
+}
+
+/// The shim's settle (500 ms) after an Exec's program ends.
+fn shim_settle() -> std::time::Duration {
+    std::time::Duration::from_millis(500)
 }
