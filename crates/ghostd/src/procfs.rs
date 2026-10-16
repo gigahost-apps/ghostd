@@ -2,6 +2,8 @@
 
 use std::collections::HashMap;
 use std::fs;
+use std::os::unix::ffi::OsStrExt;
+use std::path::Path;
 
 /// The fields of `/proc/<pid>/stat` after the command name.
 fn stat_fields(pid: u32) -> Option<Vec<String>> {
@@ -28,6 +30,27 @@ pub fn is_same_process(pid: u32, start: u64) -> bool {
         }
         None => false,
     }
+}
+
+/// Whether a `ghostd shim <dir>` process runs for this job directory (its
+/// command line names it).
+#[must_use]
+pub fn shim_runs_for(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return false;
+    };
+    let dir = dir.as_os_str().as_bytes();
+    entries.flatten().any(|entry| {
+        let is_pid = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()));
+        is_pid
+            && fs::read(entry.path().join("cmdline")).is_ok_and(|cmdline| {
+                let mut args = cmdline.split(|&b| b == 0).skip(1);
+                args.next() == Some(b"shim".as_slice()) && args.next() == Some(dir)
+            })
+    })
 }
 
 struct Entry {

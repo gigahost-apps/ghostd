@@ -474,3 +474,32 @@ async fn a_client_chosen_id_makes_a_repeat_safe() {
     assert_eq!(fs::read(env.home.join("execs")).unwrap(), b"x\n");
     assert_eq!(fs::read(env.home.join("runs")).unwrap(), b"run\n");
 }
+
+#[tokio::test]
+async fn a_job_whose_shim_runs_is_never_collected_even_without_a_status() {
+    let env = Env::with_config("stop_grace_ms = 300\njob_retention_hours = 0\n");
+    let c = env.connect().await;
+    let job = start(&c, sh("sleep 60")).await;
+    drop(c);
+    env.stop();
+    // A shim that could not write its status (a full disk), for a job
+    // started long ago.
+    let dir = env.job_dir(&job);
+    fs::remove_file(dir.join("status.json")).unwrap();
+    let mut spec: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("spec.json")).unwrap()).unwrap();
+    spec["created_at_ms"] = serde_json::json!(1_000);
+    fs::write(dir.join("spec.json"), serde_json::to_vec(&spec).unwrap()).unwrap();
+    // A finished job beside it is collected, so the collection did run.
+    let c = env.connect().await;
+    let done = start(&c, sh("true")).await;
+    wait_job(&c, &done).await;
+    drop(c);
+    env.stop();
+    let c = env.connect().await;
+    env.wait_for("the finished job to be collected", || {
+        !env.job_dir(&done).exists()
+    });
+    assert!(dir.exists(), "a job whose shim runs was collected");
+    assert_eq!(status(&c, &job).await.state, JobState::Running);
+}

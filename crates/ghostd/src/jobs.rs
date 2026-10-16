@@ -143,7 +143,12 @@ impl Jobs {
         let spec = read_spec(dir)?;
         let mut status = read_status_checked(dir)?;
         let busy = match &status {
-            None => now_ms().saturating_sub(spec.created_at_ms) < STARTING_GRACE_MS,
+            // Starting, or a shim that could not write its status: only
+            // a shim no longer running for it makes such a job finished.
+            None => {
+                now_ms().saturating_sub(spec.created_at_ms) < STARTING_GRACE_MS
+                    || procfs::shim_runs_for(dir)
+            }
             Some(s) if s.tree_gone => false,
             Some(s) => {
                 let alive = procfs::is_same_process(s.shim_pid, s.shim_start);
