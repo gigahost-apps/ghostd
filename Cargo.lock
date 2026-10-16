@@ -316,6 +316,7 @@ dependencies = [
  "grep-searcher",
  "ignore",
  "nix",
+ "rustix",
  "serde",
  "serde_json",
  "sha2",

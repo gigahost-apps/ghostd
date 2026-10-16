@@ -151,8 +151,45 @@ fn create_temp(target: &Path) -> Result<(PathBuf, File), Error> {
     Ok((tmp, file))
 }
 
-/// Gives the temp file its mode, syncs it and renames it over `target`.
+/// The extended attributes a replaced file passes on: its `SELinux` label,
+/// its ACL and the user's own. Not file capabilities or integrity
+/// signatures, which belonged to the old content.
+fn kept_xattr(name: &[u8]) -> bool {
+    name == b"security.selinux" || name == b"system.posix_acl_access" || name.starts_with(b"user.")
+}
+
+/// Gives the temp file the identity of the file it replaces, as far as this
+/// user may: its owner and group (a root daemon editing `pg_hba.conf` must
+/// leave it `postgres:postgres`; a user keeps at least a group they are in)
+/// and the extended attributes [`kept_xattr`] names. Hard links to the old
+/// file keep the old content: a replacement is a new file.
+fn keep_identity(file: &File, target: &Path) {
+    let Ok(meta) = fs::metadata(target) else {
+        return;
+    };
+    if std::os::unix::fs::fchown(file, Some(meta.uid()), Some(meta.gid())).is_err() {
+        let _ = std::os::unix::fs::fchown(file, None, Some(meta.gid()));
+    }
+    let mut names = vec![0u8; 64 * 1024];
+    let Ok(len) = rustix::fs::listxattr(target, &mut names[..]) else {
+        return;
+    };
+    let mut value = vec![0u8; 64 * 1024];
+    for name in names[..len].split(|&b| b == 0) {
+        if !kept_xattr(name) {
+            continue;
+        }
+        if let Ok(n) = rustix::fs::getxattr(target, name, &mut value[..]) {
+            let _ = rustix::fs::fsetxattr(file, name, &value[..n], rustix::fs::XattrFlags::empty());
+        }
+    }
+}
+
+/// Gives the temp file the replaced file's owner, group and attributes,
+/// then its mode (after the owner: a chown may clear set-id bits), syncs it
+/// and renames it over `target`.
 fn commit(tmp: &Path, file: &File, target: &Path, mode: u32) -> io::Result<()> {
+    keep_identity(file, target);
     file.set_permissions(fs::Permissions::from_mode(mode))?;
     file.sync_all()?;
     fs::rename(tmp, target)?;

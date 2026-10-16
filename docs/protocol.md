@@ -164,12 +164,12 @@ its ID is free again.
 |---|---|---|
 | `FileStat { path, follow }` | `Stat(Stat)` | `Stat { kind, size, mode, mtime_ms, uid, gid, link_target }`, `kind` `File`, `Dir`, `Symlink` or `Other`, `mode` the permission bits. |
 | `FileRead { path, offset, len }` | `FileData { data, size, eof }` | `len` at most 8 MiB. |
-| `FileWrite { path, data, mode, create_dirs }` | `Written { size, sha256 }` | Atomic: a temp file beside it, fsync, rename. Keeps an existing file's mode unless `mode`; new files 0644. Writes through a symlink to its target. |
+| `FileWrite { path, data, mode, create_dirs }` | `Written { size, sha256 }` | Atomic: a temp file beside it, fsync, rename. Keeps an existing file's mode unless `mode` (new files 0644) and, as far as the daemon's user may, its owner, group, SELinux label, ACL and `user.*` attributes; a hard link to the old file keeps the old content. Writes through a symlink to its target. |
 | `UploadBegin { path, mode, create_dirs }` | `Upload { handle }` | At most 16 open per connection. |
 | `UploadChunk { handle, offset, data }` | `Done` | Offsets contiguous, else `InvalidArgument`. |
-| `UploadEnd { handle, sha256 }` | `Written { size, sha256 }` | Checks the hash when given (`Conflict` and discarded on a mismatch), then renames into place atomically. |
+| `UploadEnd { handle, sha256 }` | `Written { size, sha256 }` | Checks the hash when given (`Conflict` and discarded on a mismatch), then renames into place atomically, keeping what `FileWrite` keeps. |
 | `UploadAbort { handle }` | `Done` | An unfinished upload's temp file is also removed when the connection ends. |
-| `FileEdit { path, old, new, replace_all }` | `Edited { replacements, sha256 }` | `NotFound` when `old` is absent, `Conflict` when it occurs more than once without `replace_all`. Atomic, mode kept. |
+| `FileEdit { path, old, new, replace_all }` | `Edited { replacements, sha256 }` | `NotFound` when `old` is absent, `Conflict` when it occurs more than once without `replace_all`. Atomic, keeping what `FileWrite` keeps. |
 | `FileList { path, depth, max_entries }` | `Listing { entries, truncated }` | `entries` `(relative path, Stat)`, depth first, each directory sorted by name, hidden files included, symlinks not followed. `depth` 1..=16 (0 means 1), `max_entries` default 1000, at most 100 000. |
 | `FileSearch { pattern, path, globs, case_insensitive, hidden, max_matches }` | `Matches { matches, truncated }` | A regex with ripgrep's defaults: `.gitignore` (in a git repository) and `.ignore` respected, binary files skipped, hidden files only with `hidden`. `globs` as ripgrep's `-g`. Each match `{ path (relative to the searched path), line_number, line (at most 4 KiB) }`; `max_matches` default 200, at most 10 000. |
 | `FileHash { path }` | `Hash { size, sha256 }` | |

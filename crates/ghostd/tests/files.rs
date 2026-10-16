@@ -586,3 +586,99 @@ async fn hash_remove_rename_mkdir() {
     )
     .await;
 }
+
+#[tokio::test]
+async fn a_replaced_file_keeps_its_group_and_attributes() {
+    use std::os::unix::fs::MetadataExt;
+    let env = Env::new();
+    let c = env.connect().await;
+    // A group of ours other than the one new files get: what a non-root
+    // user can give a file (root keeps the owner the same way).
+    let primary = nix::unistd::getegid();
+    let Some(group) = nix::unistd::getgroups()
+        .unwrap_or_default()
+        .into_iter()
+        .find(|g| *g != primary)
+    else {
+        eprintln!("skipped: this user is in no second group");
+        return;
+    };
+    let path = env.home.join("conf");
+    fs::write(&path, b"a = 1\n").unwrap();
+    std::os::unix::fs::chown(&path, None, Some(group.as_raw())).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+    let attributes = rustix::fs::setxattr(
+        &path,
+        "user.ghostd-test",
+        b"kept",
+        rustix::fs::XattrFlags::empty(),
+    )
+    .is_ok();
+    let check = |what: &str| {
+        let meta = fs::metadata(&path).unwrap();
+        assert_eq!(meta.gid(), group.as_raw(), "{what} changed the group");
+        assert_eq!(meta.mode() & 0o7777, 0o640, "{what} changed the mode");
+        if attributes {
+            let mut value = [0u8; 16];
+            let n = rustix::fs::getxattr(&path, "user.ghostd-test", &mut value[..])
+                .unwrap_or_else(|e| panic!("{what} dropped the attribute: {e}"));
+            assert_eq!(&value[..n], b"kept");
+        }
+    };
+    call(
+        &c,
+        Request::FileWrite {
+            path: b"conf".to_vec(),
+            data: b"a = 2\n".to_vec(),
+            mode: None,
+            create_dirs: false,
+        },
+    )
+    .await;
+    check("a write");
+    call(
+        &c,
+        Request::FileEdit {
+            path: b"conf".to_vec(),
+            old: b"2".to_vec(),
+            new: b"3".to_vec(),
+            replace_all: false,
+        },
+    )
+    .await;
+    check("an edit");
+    let Response::Upload { handle } = call(
+        &c,
+        Request::UploadBegin {
+            path: b"conf".to_vec(),
+            mode: None,
+            create_dirs: false,
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    call(
+        &c,
+        Request::UploadChunk {
+            handle,
+            offset: 0,
+            data: b"a = 4\n".to_vec(),
+        },
+    )
+    .await;
+    call(
+        &c,
+        Request::UploadEnd {
+            handle,
+            sha256: None,
+        },
+    )
+    .await;
+    check("an upload");
+    assert_eq!(fs::read(&path).unwrap(), b"a = 4\n");
+    if !attributes {
+        eprintln!("attributes not checked: the file system takes no user attributes");
+    }
+}
