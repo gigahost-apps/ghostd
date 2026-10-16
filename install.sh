@@ -273,5 +273,5 @@ if "$prefix/bin/ghostd" status 2>/dev/null | grep -q '"running":true'; then
 fi
 case ":$PATH:" in
     *":$prefix/bin:"*) ;;
-    *) say "$prefix/bin is not on your PATH; forced-command keys name the binary's full path, so ssh works anyway" ;;
+    *) say "$prefix/bin is not on your PATH; a client runs ghostd by its full path ($prefix/bin/ghostd stdio), so ssh works anyway" ;;
 esac

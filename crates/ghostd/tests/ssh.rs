@@ -1,7 +1,8 @@
 //! End to end over a real sshd: a private `sshd` on 127.0.0.1 with temp
-//! keys, a key authorized by `ghostd setup --authorize-key`, and `ssh` as
-//! the transport. Ignored by default (it needs `/usr/sbin/sshd`); the
-//! checks run it with `--ignored`.
+//! keys, its own temp `AuthorizedKeysFile` written by the test (the test's
+//! sshd configuration; ghostd never touches one), and `ssh` as the
+//! transport running `<binary> stdio` as the remote command. Ignored by
+//! default (it needs `/usr/sbin/sshd`); the checks run it with `--ignored`.
 
 #![allow(clippy::too_many_lines)]
 
@@ -13,7 +14,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use common::{Env, exec};
+use common::{EXE, Env, exec};
 use ghostd_client::Connection;
 use ghostd_protocol::v1::{ExecSpec, Outcome, Program, Request, Response};
 
@@ -39,7 +40,7 @@ fn keygen(path: &Path) {
 
 #[tokio::test]
 #[ignore = "starts a private sshd; run with --ignored"]
-async fn over_ssh_with_a_forced_command() {
+async fn over_ssh_with_the_users_access() {
     if !Path::new(SSHD).exists() {
         eprintln!("skipping: no {SSHD}");
         return;
@@ -49,21 +50,8 @@ async fn over_ssh_with_a_forced_command() {
     keygen(&tmp.join("host_key"));
     keygen(&tmp.join("client_key"));
     let public = fs::read_to_string(tmp.join("client_key.pub")).unwrap();
-    let out = env
-        .cmd(&[
-            "setup",
-            "--authorize-key",
-            public.trim(),
-            "--label",
-            "ssh-test",
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    let authorized = tmp.join("authorized_keys");
+    fs::write(&authorized, format!("{}\n", public.trim())).unwrap();
 
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
@@ -77,7 +65,7 @@ HostKey {tmp}/host_key
 PidFile {tmp}/sshd.pid
 UsePAM no
 StrictModes no
-AuthorizedKeysFile {home}/.ssh/authorized_keys
+AuthorizedKeysFile {authorized}
 PubkeyAuthentication yes
 PasswordAuthentication no
 KbdInteractiveAuthentication no
@@ -89,6 +77,7 @@ SetEnv GHOSTD_STATE_DIR={state} GHOSTD_RUNTIME_DIR={runtime} GHOSTD_CONFIG={conf
 ",
         tmp = tmp.display(),
         home = env.home.display(),
+        authorized = authorized.display(),
         state = env.state.display(),
         runtime = env.runtime.display(),
         config = env.config.display(),
@@ -114,7 +103,6 @@ SetEnv GHOSTD_STATE_DIR={state} GHOSTD_RUNTIME_DIR={runtime} GHOSTD_CONFIG={conf
         );
         std::thread::sleep(Duration::from_millis(50));
     }
-    let pwned = tmp.join("pwned");
     let argv: Vec<String> = vec![
         "ssh".into(),
         "-T".into(),
@@ -137,8 +125,9 @@ SetEnv GHOSTD_STATE_DIR={state} GHOSTD_RUNTIME_DIR={runtime} GHOSTD_CONFIG={conf
         "-o".into(),
         "LogLevel=ERROR".into(),
         "127.0.0.1".into(),
-        // The forced command ignores what the client asks to run.
-        format!("touch {}", pwned.display()),
+        // The full path: a non-login `ssh host cmd` may not have the
+        // install directory on PATH.
+        format!("{EXE} stdio --client ssh-test"),
     ];
     let c = match Connection::spawn(&argv).await {
         Ok(c) => c,
@@ -180,5 +169,4 @@ SetEnv GHOSTD_STATE_DIR={state} GHOSTD_RUNTIME_DIR={runtime} GHOSTD_CONFIG={conf
         .flat_map(|a| a.iter().copied().chain(std::iter::once(0)))
         .collect();
     assert_eq!(r.stdout.data, expected);
-    assert!(!pwned.exists(), "the client's remote command ran");
 }

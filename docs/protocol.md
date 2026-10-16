@@ -1,8 +1,9 @@
 # The ghostd protocol
 
 A client talks to `ghostd` over one byte stream: the stdin and stdout of
-`ghostd stdio`, usually the channel of an SSH connection whose key runs it
-as a forced command. Nothing in the stream is ever parsed by a shell:
+`ghostd stdio`, usually the channel of an SSH connection with the user's
+own access that runs it by its full path
+(`ssh -T host /home/you/.local/bin/ghostd stdio`). Nothing in the stream is ever parsed by a shell:
 arguments, paths and data travel inside length-prefixed binary frames as
 bytes.
 
@@ -51,7 +52,7 @@ always tell each other what they speak:
 
 `RelayInfo` is the relay preamble: the first frame `ghostd stdio` writes to
 the daemon's Unix socket, before any of the client's bytes. It carries the
-forced command's `--client <label>` and `$SSH_CONNECTION`. A client never
+relay's `--client <label>` and `$SSH_CONNECTION`. A client never
 sees or sends it.
 
 ## Versioning

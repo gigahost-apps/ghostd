@@ -1,8 +1,8 @@
 //! A client connection to `ghostd`.
 //!
 //! [`Connection::spawn`] runs a command whose stdin and stdout reach a
-//! `ghostd stdio` (typically `ssh -T host ghostd stdio`, or a key with a
-//! forced command), [`Connection::from_io`] uses any byte stream. Either
+//! `ghostd stdio` (typically `ssh -T host /full/path/ghostd stdio`),
+//! [`Connection::from_io`] uses any byte stream. Either
 //! scans for the marker (skipping a login shell's banner), negotiates the
 //! protocol version and then answers [`Connection::call`]s, many at once,
 //! over the one stream.

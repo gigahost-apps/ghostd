@@ -6,11 +6,13 @@ and file reads, writes and edits, reached over the machine's own SSH with
 no quoting and one kept connection.
 
 It is one binary that needs no service manager:
-`ghostd stdio`, the command an SSH key runs, starts the daemon when none
-runs. Jobs run under their own supervisor process, so they survive the
+`ghostd stdio`, the command a client runs over the user's own SSH access,
+starts the daemon when none runs. ghostd never reads or changes anything
+under `~/.ssh`. Jobs run under their own supervisor process, so they survive the
 connection, the daemon's restarts and its crashes, and stopping one kills
-everything it started (a daemon it starts, detached in a session of its
-own, outlives the program's normal end). See [the protocol](docs/protocol.md).
+everything it started. No process is leaked: what a command leaves behind
+in the background is stopped when it ends, so a server is started as a job
+(see [Background processes](#background-processes)). See [the protocol](docs/protocol.md).
 
 ## Install from source
 
@@ -39,48 +41,28 @@ with `cargo build --release --locked` on the toolchain pinned in
 `rust-toolchain.toml` (a Rust without rustup and without that target
 builds for the host's C library, and says so), installs
 `~/.local/bin/ghostd` (`/usr/local/bin/ghostd` as root, or `--prefix`),
-then runs `ghostd setup`. Options for `ghostd setup` go after `--`:
-
-```sh
-sh install.sh -- --authorize-key "$(cat agent_key.pub)" --label agent
-```
-
-## Authorize a key
-
-```sh
-ghostd setup --authorize-key "ssh-ed25519 AAAA… agent@laptop" --label agent
-```
-
-adds to `~/.ssh/authorized_keys`:
-
-```
-command="/home/you/.local/bin/ghostd stdio --client agent",restrict ssh-ed25519 AAAA… ghostd:agent
-```
-
-That key then runs only `ghostd`, whatever command the client asks for;
-`restrict` turns off forwarding and terminals. The file is rewritten
-atomically and every other line is kept byte for byte. A key already
-authorized for plain logins is refused unless `--replace` asks to turn it
-into a ghostd-only key (it loses shell access). A line that is replaced
-keeps its restrictions (`from=`, `expiry-time=` and the like), so a key
-limited to some addresses stays limited. `ghostd keys list` and
-`ghostd keys remove <label>` only ever touch lines marked `ghostd:<label>`.
+then runs `ghostd setup`, which creates the directories and a commented
+configuration file and records where the binary came from.
 
 ## Connect
 
-With a forced-command key, any SSH connection with that key reaches
-`ghostd`: `ssh -T -i agent_key host`. With an ordinary key, run it
-yourself: `ssh -T host ghostd stdio`. A user install may need the full
-path, `ssh -T host ~/.local/bin/ghostd stdio`, because a non-login SSH
-command does not read `~/.profile`, which usually adds `~/.local/bin` to
-`PATH`. Output a login shell prints first is
+A client connects with the SSH access the user already has, running the
+fixed command
+
+```sh
+ssh -T host /home/you/.local/bin/ghostd stdio [--client <label>]
+```
+
+by its full path, because a non-login `ssh host cmd` does not read
+`~/.profile` and may not have `~/.local/bin` on `PATH`. `--client` names
+the client in the daemon's log. Output a login shell prints first is
 skipped: `ghostd` opens with a fixed marker and the client discards what
 comes before it.
 
 From Rust, `ghostd-client`:
 
 ```rust
-let c = ghostd_client::Connection::spawn(&["ssh", "-T", "host", "ghostd", "stdio"]).await?;
+let c = ghostd_client::Connection::spawn(&["ssh", "-T", "host", "/home/you/.local/bin/ghostd", "stdio"]).await?;
 let answer = c.call(Request::Exec(ExecSpec {
     program: Program::Argv(vec![b"ls".to_vec(), b"-la".to_vec()]),
     ..ExecSpec::default()
@@ -92,8 +74,7 @@ let answer = c.call(Request::Exec(ExecSpec {
 | Command | |
 |---|---|
 | `ghostd stdio [--client <label>]` | Relay stdin and stdout to the daemon, starting it when none runs. |
-| `ghostd setup [--authorize-key <key> --label <label> [--replace]]` | Create the directories and a commented configuration file; authorize a key. |
-| `ghostd keys list`, `ghostd keys remove <label>` | The forced-command keys. |
+| `ghostd setup` | Create the directories and a commented configuration file. |
 | `ghostd status` | JSON: whether the daemon runs, its pid and version, the socket, job counts. |
 | `ghostd stop` | Stop the daemon; jobs keep running. The next `ghostd stdio` starts it again. |
 | `ghostd daemon` | Run the supervisor in the foreground of a new session (what `ghostd stdio` starts). |

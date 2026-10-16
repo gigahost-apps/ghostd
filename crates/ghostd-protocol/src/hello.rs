@@ -58,7 +58,7 @@ pub enum HelloAnswer {
 /// FROZEN.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelayInfo {
-    /// The forced command's `--client <label>`.
+    /// The relay's `--client <label>`.
     pub client_label: Option<String>,
     /// `$SSH_CONNECTION` of the relay, when it runs under sshd.
     pub ssh_connection: Option<String>,
