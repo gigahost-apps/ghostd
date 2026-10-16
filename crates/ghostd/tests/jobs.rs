@@ -1,0 +1,356 @@
+//! Jobs: their lifecycle, logs, stops, and survival of the daemon's death.
+
+#![allow(clippy::too_many_lines)]
+
+mod common;
+
+use std::time::{Duration, Instant};
+
+use common::{Env, alive, exec, sh, signal, start, status, wait_gone, wait_job};
+use ghostd_client::Connection;
+use ghostd_protocol::v1::{ErrorKind, JobState, LogSlice, Request, Response, Stream};
+
+async fn log(
+    c: &Connection,
+    job: &str,
+    stream: Stream,
+    offset: Option<u64>,
+    max_len: u32,
+) -> LogSlice {
+    match c
+        .call(Request::JobLogRead {
+            job_id: job.into(),
+            stream,
+            offset,
+            max_len,
+        })
+        .await
+        .unwrap()
+    {
+        Response::LogSlice(s) => s,
+        other => panic!("{other:?}"),
+    }
+}
+
+async fn wait_output(c: &Connection, job: &str, needle: &str) -> String {
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let s = log(c, job, Stream::Stdout, Some(0), 65536).await;
+        let text = String::from_utf8_lossy(&s.data).into_owned();
+        if text.contains(needle) {
+            return text;
+        }
+        assert!(Instant::now() < until, "no {needle:?} in {text:?}");
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+fn remote_kind(e: &ghostd_client::ClientError) -> ErrorKind {
+    match e {
+        ghostd_client::ClientError::Remote(e) => e.kind,
+        other => panic!("{other}"),
+    }
+}
+
+#[tokio::test]
+async fn lifecycle() {
+    let env = Env::new();
+    let c = env.connect().await;
+    let mut spec = sh("echo started; sleep 30");
+    spec.name = Some("sleeper".into());
+    let job = start(&c, spec).await;
+    wait_output(&c, &job, "started").await;
+    let info = status(&c, &job).await;
+    assert_eq!(info.state, JobState::Running);
+    assert_eq!(info.name.as_deref(), Some("sleeper"));
+    assert!(
+        info.argv_summary.starts_with("/bin/sh -c echo started"),
+        "{}",
+        info.argv_summary
+    );
+    let Response::Jobs(running) = c
+        .call(Request::JobList {
+            include_finished: false,
+            limit: 10,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(running.len(), 1);
+    // A wait that times out answers Running.
+    let begun = Instant::now();
+    let Response::Job(waited) = c
+        .call(Request::JobWait {
+            job_id: job.clone(),
+            timeout_ms: 200,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(waited.state, JobState::Running);
+    assert!(begun.elapsed() >= Duration::from_millis(200));
+    let e = c
+        .call(Request::JobRemove {
+            job_id: job.clone(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(remote_kind(&e), ErrorKind::Busy);
+    c.call(Request::JobSignal {
+        job_id: job.clone(),
+        signal: 15,
+    })
+    .await
+    .unwrap();
+    let info = wait_job(&c, &job).await;
+    assert_eq!(info.state, JobState::Signaled { signal: 15 });
+    assert!(info.ended_at_ms.is_some());
+    let e = c
+        .call(Request::JobSignal {
+            job_id: job.clone(),
+            signal: 15,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(remote_kind(&e), ErrorKind::Conflict);
+    // Its shim may still be finishing; removal succeeds once it is gone.
+    let until = Instant::now() + Duration::from_secs(5);
+    loop {
+        match c
+            .call(Request::JobRemove {
+                job_id: job.clone(),
+            })
+            .await
+        {
+            Ok(_) => break,
+            Err(_) if Instant::now() < until => tokio::time::sleep(Duration::from_millis(25)).await,
+            Err(e) => panic!("{e}"),
+        }
+    }
+    let e = c
+        .call(Request::JobStatus { job_id: job })
+        .await
+        .unwrap_err();
+    assert_eq!(remote_kind(&e), ErrorKind::NotFound);
+    let e = c
+        .call(Request::JobStatus {
+            job_id: "j../../../etc".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(remote_kind(&e), ErrorKind::NotFound);
+}
+
+#[tokio::test]
+async fn log_slices_across_rotation() {
+    let env = Env::with_config("stop_grace_ms = 300\nlog_max_bytes = 1024\n");
+    let c = env.connect().await;
+    let expected: Vec<u8> = (1..=2000)
+        .flat_map(|i| format!("{i}\n").into_bytes())
+        .collect();
+    let job = start(&c, sh("seq 1 2000")).await;
+    assert_eq!(wait_job(&c, &job).await.state, JobState::Exited { code: 0 });
+    let tail = log(&c, &job, Stream::Stdout, None, 100).await;
+    assert_eq!(tail.total, expected.len() as u64);
+    assert_eq!(tail.data, expected[expected.len() - 100..]);
+    assert_eq!(tail.offset, expected.len() as u64 - 100);
+    let head = log(&c, &job, Stream::Stdout, Some(0), 1_000_000).await;
+    assert!(head.first_available > 0, "nothing was rotated away");
+    assert_eq!(head.offset, head.first_available);
+    let kept = usize::try_from(head.first_available).unwrap();
+    assert_eq!(head.data, expected[kept..]);
+    assert!(head.data.len() > 1024, "the rotated file is read too");
+    // A slice in the middle.
+    let mid = log(
+        &c,
+        &job,
+        Stream::Stdout,
+        Some(head.first_available + 10),
+        50,
+    )
+    .await;
+    assert_eq!(mid.data, expected[kept + 10..kept + 60]);
+    assert!(mid.ended);
+    let empty = log(&c, &job, Stream::Stderr, None, 100).await;
+    assert_eq!(empty.total, 0);
+}
+
+#[tokio::test]
+async fn stop_kills_the_whole_tree() {
+    let env = Env::new();
+    let c = env.connect().await;
+    let script = "setsid sleep 300 & echo $!; (sleep 301 & echo $!); trap '' TERM; echo ready; while :; do sleep 1; done";
+    let job = start(&c, sh(script)).await;
+    let out = wait_output(&c, &job, "ready").await;
+    let pids: Vec<u32> = out.lines().filter_map(|l| l.trim().parse().ok()).collect();
+    assert_eq!(pids.len(), 2, "{out}");
+    let info = status(&c, &job).await;
+    let program = info.pid.unwrap();
+    for &pid in &pids {
+        assert!(alive(pid));
+    }
+    let shim = env.processes("shim");
+    assert_eq!(shim.len(), 1);
+    let Response::Job(stopped) = c
+        .call(Request::JobStop {
+            job_id: job.clone(),
+            grace_ms: Some(300),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        stopped.state,
+        JobState::Signaled { signal: 9 },
+        "it ignored SIGTERM"
+    );
+    for pid in pids.iter().copied().chain([program]) {
+        assert!(!alive(pid), "{pid} survived the stop");
+    }
+    assert!(!alive(shim[0]));
+}
+
+#[tokio::test]
+async fn jobs_survive_the_worker_and_the_daemon() {
+    let env = Env::new();
+    let c = env.connect().await;
+    let job = start(&c, sh("sleep 60")).await;
+    let workers = env.processes("worker");
+    assert_eq!(workers.len(), 1);
+    signal(workers[0], 9);
+    env.wait_for("a new worker", || {
+        let now = env.processes("worker");
+        now.len() == 1 && now[0] != workers[0]
+    });
+    drop(c);
+    let until = Instant::now() + Duration::from_secs(10);
+    let c = loop {
+        if let Ok(c) = env.try_connect(ghostd_client::Options::default()).await {
+            break c;
+        }
+        assert!(Instant::now() < until);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(status(&c, &job).await.state, JobState::Running);
+    drop(c);
+    // Now the whole daemon.
+    for pid in env.processes("daemon") {
+        signal(pid, 9);
+    }
+    for pid in env.processes("worker") {
+        signal(pid, 9);
+    }
+    env.wait_for("no daemon", || {
+        env.processes("daemon").is_empty() && env.processes("worker").is_empty()
+    });
+    let c = env.connect().await;
+    assert_eq!(env.processes("daemon").len(), 1);
+    assert_eq!(status(&c, &job).await.state, JobState::Running);
+    let Response::Job(stopped) = c
+        .call(Request::JobStop {
+            job_id: job,
+            grace_ms: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(stopped.state, JobState::Signaled { signal: 15 });
+}
+
+#[tokio::test]
+async fn a_killed_shim_is_lost_and_nothing_is_killed_for_it() {
+    let env = Env::new();
+    let c = env.connect().await;
+    let job = start(&c, sh("sleep 60")).await;
+    let info = status(&c, &job).await;
+    let program = info.pid.unwrap();
+    let shim = env.processes("shim");
+    assert_eq!(shim.len(), 1);
+    signal(shim[0], 9);
+    wait_gone(shim[0]);
+    assert_eq!(status(&c, &job).await.state, JobState::Lost);
+    // A stop of a lost job kills nothing by pid.
+    let Response::Job(after) = c
+        .call(Request::JobStop {
+            job_id: job.clone(),
+            grace_ms: Some(10),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(after.state, JobState::Lost);
+    assert!(alive(program), "a lost job's program was killed");
+    signal(program, 9);
+    c.call(Request::JobRemove { job_id: job }).await.unwrap();
+}
+
+#[tokio::test]
+async fn gc_keeps_running_jobs() {
+    let env =
+        Env::with_config("stop_grace_ms = 300\nmax_jobs_kept = 1\nexec_retention_hours = 0\n");
+    let c = env.connect().await;
+    let running = start(&c, sh("sleep 60")).await;
+    for _ in 0..2 {
+        let done = start(&c, sh("true")).await;
+        wait_job(&c, &done).await;
+    }
+    exec(&c, sh("true")).await;
+    drop(c);
+    env.stop();
+    // The next worker collects at its start.
+    let c = env.connect().await;
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let Response::Jobs(jobs) = c
+            .call(Request::JobList {
+                include_finished: true,
+                limit: 0,
+            })
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        if jobs.len() == 1 {
+            assert_eq!(jobs[0].job_id, running);
+            assert_eq!(jobs[0].state, JobState::Running);
+            break;
+        }
+        assert!(Instant::now() < until, "{jobs:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test]
+async fn max_running_jobs_refuses_more() {
+    let env = Env::with_config("stop_grace_ms = 300\nmax_running_jobs = 1\n");
+    let c = env.connect().await;
+    let _job = start(&c, sh("sleep 60")).await;
+    let e = c.call(Request::JobStart(sh("true"))).await.unwrap_err();
+    assert_eq!(remote_kind(&e), ErrorKind::Busy);
+    let e = c.call(Request::Exec(sh("true"))).await.unwrap_err();
+    assert_eq!(remote_kind(&e), ErrorKind::Busy);
+}
+
+#[tokio::test]
+async fn a_job_timeout_stops_it() {
+    let env = Env::new();
+    let c = env.connect().await;
+    let mut spec = sh("sleep 60");
+    spec.timeout_ms = Some(200);
+    let job = start(&c, spec).await;
+    assert_eq!(
+        wait_job(&c, &job).await.state,
+        JobState::Signaled { signal: 15 }
+    );
+}

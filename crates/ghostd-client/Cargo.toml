@@ -1,0 +1,16 @@
+[package]
+name = "ghostd-client"
+description = "A client connection to ghostd over any byte stream or a spawned command such as ssh"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+ghostd-protocol.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[lints]
+workspace = true

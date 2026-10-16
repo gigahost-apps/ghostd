@@ -1,0 +1,17 @@
+[package]
+name = "ghostd-protocol"
+description = "The wire protocol of ghostd: frames, the marker, the frozen hellos and the versioned messages"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_bytes.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

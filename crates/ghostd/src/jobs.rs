@@ -1,0 +1,931 @@
+//! Jobs, seen from the worker: starting shims, reading their state and
+//! logs, stopping them and collecting old ones.
+
+use std::fs::{self, DirBuilder, File, OpenOptions};
+use std::io;
+use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use ghostd_protocol::v1::{
+    Error, ErrorKind, ExecResult, ExecSpec, JobInfo, JobState, LogSlice, MAX_DATA, Outcome, Output,
+    Program, Stream,
+};
+use nix::fcntl::{Flock, FlockArg};
+use nix::sys::signal::{Signal, kill, killpg};
+use nix::unistd::Pid;
+
+use crate::config::{Config, MAX_EXEC_TIMEOUT_MS, MAX_OUTPUT_CAP};
+use crate::jobfiles::{
+    Kind, LOG_LOCK, SCRIPT, SPEC, STDIN, STOP, SpecFile, State, StatusFile, log_name, read_spec,
+    read_status, rotated_name,
+};
+use crate::procfs;
+use crate::util::{B64, atomic_write, err, io_error, now_ms, random_hex, resolve};
+
+/// How long a `JobWait` may wait.
+const MAX_WAIT_MS: u64 = 60_000;
+/// A job directory without a status this old is a shim that never started.
+const STARTING_GRACE_MS: u64 = 30_000;
+/// What an exec's two outputs may take of a frame, leaving room for the rest.
+const EXEC_OUTPUT_BUDGET: usize = ghostd_protocol::MAX_FRAME - 64 * 1024;
+/// How often job state is polled.
+const POLL: Duration = Duration::from_millis(50);
+
+pub struct Jobs {
+    root: PathBuf,
+    config: Config,
+    start_lock: tokio::sync::Mutex<()>,
+}
+
+/// A job's state as read from its directory.
+struct Live {
+    spec: SpecFile,
+    status: Option<StatusFile>,
+    /// The shim (and so the program or what it left) still runs.
+    busy: bool,
+}
+
+fn valid_id(id: &str) -> bool {
+    id.len() == 17
+        && id.starts_with('j')
+        && id[1..]
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+fn not_found(id: &str) -> Error {
+    err(ErrorKind::NotFound, format!("no job {id}"))
+}
+
+fn blocking_error(e: &tokio::task::JoinError) -> Error {
+    err(ErrorKind::Internal, format!("a task failed: {e}"))
+}
+
+/// Runs blocking work off the async threads.
+async fn blocking<T, F>(f: F) -> Result<T, Error>
+where
+    F: FnOnce() -> Result<T, Error> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| blocking_error(&e))?
+}
+
+fn pid(raw: u32) -> Pid {
+    Pid::from_raw(i32::try_from(raw).unwrap_or(i32::MAX))
+}
+
+/// The first four arguments, lossy, at most 200 characters.
+fn summarize(argv: &[Vec<u8>]) -> String {
+    let joined = argv
+        .iter()
+        .take(4)
+        .map(|a| String::from_utf8_lossy(a).into_owned())
+        .collect::<Vec<_>>()
+        .join(" ");
+    joined.chars().take(200).collect()
+}
+
+fn check_bytes(what: &str, bytes: &[u8]) -> Result<(), Error> {
+    if bytes.contains(&0) {
+        return Err(err(
+            ErrorKind::InvalidArgument,
+            format!("{what} contains a NUL byte"),
+        ));
+    }
+    Ok(())
+}
+
+impl Jobs {
+    #[must_use]
+    pub fn new(root: PathBuf, config: Config) -> Self {
+        Self {
+            root,
+            config,
+            start_lock: tokio::sync::Mutex::new(()),
+        }
+    }
+
+    fn dir(&self, id: &str) -> Result<PathBuf, Error> {
+        if !valid_id(id) {
+            return Err(not_found(id));
+        }
+        let dir = self.root.join(id);
+        if dir.join(SPEC).is_file() {
+            Ok(dir)
+        } else {
+            Err(not_found(id))
+        }
+    }
+
+    fn live(dir: &Path) -> io::Result<Live> {
+        let spec = read_spec(dir)?;
+        let mut status = read_status(dir);
+        let busy = match &status {
+            None => now_ms().saturating_sub(spec.created_at_ms) < STARTING_GRACE_MS,
+            Some(s) if s.tree_gone => false,
+            Some(s) => {
+                let alive = procfs::is_same_process(s.shim_pid, s.shim_start);
+                if !alive {
+                    // It may have written its final state just before
+                    // exiting: read again.
+                    status = read_status(dir);
+                }
+                alive
+            }
+        };
+        Ok(Live { spec, status, busy })
+    }
+
+    fn state(live: &Live) -> JobState {
+        match &live.status {
+            None if live.busy => JobState::Running,
+            None => JobState::Lost,
+            Some(s) => match s.state {
+                State::Running if live.busy => JobState::Running,
+                State::Running | State::FailedToStart => JobState::Lost,
+                State::Exited => JobState::Exited {
+                    code: s.code.unwrap_or(-1),
+                },
+                State::Signaled => JobState::Signaled {
+                    signal: s.signal.unwrap_or(0),
+                },
+            },
+        }
+    }
+
+    fn info_of(id: &str, live: &Live) -> JobInfo {
+        let status = live.status.as_ref();
+        JobInfo {
+            job_id: id.to_string(),
+            name: live.spec.name.clone(),
+            argv_summary: live.spec.summary.clone(),
+            state: Self::state(live),
+            started_at_ms: status.map_or(live.spec.created_at_ms, |s| s.started_at_ms),
+            ended_at_ms: status.and_then(|s| s.ended_at_ms),
+            stdout_total: status.map_or(0, |s| s.stdout.total),
+            stderr_total: status.map_or(0, |s| s.stderr.total),
+            pid: status.and_then(|s| s.pid),
+        }
+    }
+
+    /// A job's info.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an unknown job.
+    pub fn info(&self, id: &str) -> Result<JobInfo, Error> {
+        let dir = self.dir(id)?;
+        let live = Self::live(&dir).map_err(|_| not_found(id))?;
+        Ok(Self::info_of(id, &live))
+    }
+
+    /// Every job directory's ID.
+    fn ids(&self) -> Vec<String> {
+        let Ok(entries) = fs::read_dir(&self.root) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter_map(|e| e.file_name().to_str().map(str::to_string))
+            .filter(|id| valid_id(id))
+            .collect()
+    }
+
+    /// The jobs, newest first.
+    #[must_use]
+    pub fn list(&self, include_finished: bool, limit: u32) -> Vec<JobInfo> {
+        let limit = if limit == 0 { 100 } else { limit as usize };
+        let mut jobs: Vec<JobInfo> = self
+            .ids()
+            .into_iter()
+            .filter_map(|id| {
+                let live = Self::live(&self.root.join(&id)).ok()?;
+                Some(Self::info_of(&id, &live))
+            })
+            .filter(|info| include_finished || info.state == JobState::Running)
+            .collect();
+        jobs.sort_by(|a, b| {
+            b.started_at_ms
+                .cmp(&a.started_at_ms)
+                .then_with(|| b.job_id.cmp(&a.job_id))
+        });
+        jobs.truncate(limit);
+        jobs
+    }
+
+    /// How many jobs still have a running shim, and how many are finished.
+    #[must_use]
+    pub fn counts(&self) -> (usize, usize) {
+        let mut running = 0;
+        let mut finished = 0;
+        for id in self.ids() {
+            match Self::live(&self.root.join(&id)) {
+                Ok(live) if live.busy => running += 1,
+                Ok(_) => finished += 1,
+                Err(_) => {}
+            }
+        }
+        (running, finished)
+    }
+
+    /// Resolves an [`ExecSpec`] into what the shim runs, writing the stdin
+    /// and script files into `dir`.
+    #[allow(clippy::too_many_lines)]
+    fn prepare(&self, spec: &ExecSpec, kind: Kind, dir: &Path) -> Result<SpecFile, Error> {
+        let mut argv: Vec<Vec<u8>> = match &spec.program {
+            Program::Argv(argv) => {
+                if argv.first().is_none_or(Vec::is_empty) {
+                    return Err(err(
+                        ErrorKind::InvalidArgument,
+                        "argv is empty or its program is empty",
+                    ));
+                }
+                argv.clone()
+            }
+            Program::Script {
+                body,
+                interpreter,
+                args,
+            } => {
+                let script = dir.join(SCRIPT);
+                atomic_write(&script, body, 0o700, false)
+                    .map_err(|e| io_error(&e, "writing the script"))?;
+                let script = script.into_os_string().into_encoded_bytes();
+                let mut argv = match interpreter {
+                    Some(interpreter) if interpreter.first().is_none_or(Vec::is_empty) => {
+                        return Err(err(ErrorKind::InvalidArgument, "the interpreter is empty"));
+                    }
+                    Some(interpreter) => interpreter.clone(),
+                    None if body.starts_with(b"#!") => Vec::new(),
+                    None => vec![b"/bin/sh".to_vec()],
+                };
+                argv.push(script);
+                argv.extend(args.iter().cloned());
+                argv
+            }
+        };
+        for arg in &argv {
+            check_bytes("an argument", arg)?;
+        }
+        let summary = summarize(&argv);
+        if spec.login {
+            let shell = std::env::var_os("SHELL")
+                .filter(|s| !s.is_empty())
+                .map_or_else(
+                    || b"/bin/sh".to_vec(),
+                    std::ffi::OsString::into_encoded_bytes,
+                );
+            let mut login = vec![shell, b"-lc".to_vec(), b"exec \"$0\" \"$@\"".to_vec()];
+            login.append(&mut argv);
+            argv = login;
+        }
+        for (name, value) in &spec.env {
+            if name.is_empty() || name.contains(&b'=') {
+                return Err(err(
+                    ErrorKind::InvalidArgument,
+                    "an environment name is empty or holds '='",
+                ));
+            }
+            check_bytes("an environment name", name)?;
+            check_bytes("an environment value", value)?;
+        }
+        for name in &spec.env_remove {
+            check_bytes("an environment name", name)?;
+        }
+        let cwd = resolve(spec.cwd.as_deref().unwrap_or_default());
+        let timeout_ms = match kind {
+            Kind::Exec => {
+                let t = spec.timeout_ms.unwrap_or(self.config.exec_timeout_ms);
+                if t == 0 || t > MAX_EXEC_TIMEOUT_MS {
+                    return Err(err(
+                        ErrorKind::InvalidArgument,
+                        format!("timeout_ms is 1..={MAX_EXEC_TIMEOUT_MS}"),
+                    ));
+                }
+                Some(t)
+            }
+            Kind::Job => {
+                if spec.timeout_ms == Some(0) {
+                    return Err(err(ErrorKind::InvalidArgument, "timeout_ms is 0"));
+                }
+                spec.timeout_ms
+            }
+        };
+        if let Some(stdin) = &spec.stdin {
+            atomic_write(&dir.join(STDIN), stdin, 0o600, false)
+                .map_err(|e| io_error(&e, "writing stdin"))?;
+        }
+        Ok(SpecFile {
+            kind,
+            argv: argv.into_iter().map(B64).collect(),
+            env: spec
+                .env
+                .iter()
+                .map(|(n, v)| (B64(n.clone()), B64(v.clone())))
+                .collect(),
+            env_remove: spec.env_remove.iter().cloned().map(B64).collect(),
+            env_clear: spec.env_clear,
+            cwd: B64(cwd.into_os_string().into_encoded_bytes()),
+            stdin: spec.stdin.is_some(),
+            timeout_ms,
+            kill_on_timeout: kind == Kind::Job || !spec.keep_on_timeout,
+            stop_grace_ms: self.config.stop_grace_ms,
+            log_max_bytes: self.config.log_max_bytes,
+            name: spec.name.clone(),
+            summary,
+            created_at_ms: now_ms(),
+        })
+    }
+
+    /// Starts a shim for `spec` and waits until it has started the program
+    /// (or failed to).
+    async fn start(self: &Arc<Self>, spec: ExecSpec, kind: Kind) -> Result<Started, StartError> {
+        let _guard = self.start_lock.lock().await;
+        let this = Arc::clone(self);
+        let (id, dir) = blocking(move || {
+            let (running, _) = this.counts();
+            if running as u64 >= this.config.max_running_jobs {
+                return Err(err(
+                    ErrorKind::Busy,
+                    format!(
+                        "{running} jobs run, the most allowed (max_running_jobs); stop or wait for one"
+                    ),
+                ));
+            }
+            let id = format!(
+                "j{}",
+                random_hex(8).map_err(|e| io_error(&e, "random bytes"))?
+            );
+            let dir = this.root.join(&id);
+            DirBuilder::new()
+                .mode(0o700)
+                .create(&dir)
+                .map_err(|e| io_error(&e, "creating the job directory"))?;
+            let file = match this.prepare(&spec, kind, &dir) {
+                Ok(file) => file,
+                Err(e) => {
+                    let _ = fs::remove_dir_all(&dir);
+                    return Err(e);
+                }
+            };
+            let bytes = serde_json::to_vec(&file).map_err(|e| err(ErrorKind::Internal, e.to_string()))?;
+            if let Err(e) = atomic_write(&dir.join(SPEC), &bytes, 0o600, true) {
+                let _ = fs::remove_dir_all(&dir);
+                return Err(io_error(&e, "writing the job's spec"));
+            }
+            Ok((id, dir))
+        })
+        .await?;
+        let mut command = tokio::process::Command::new("/proc/self/exe");
+        command
+            .arg0("ghostd")
+            .arg("shim")
+            .arg(&dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                let _ = fs::remove_dir_all(&dir);
+                return Err(io_error(&e, "starting the shim").into());
+            }
+        };
+        let (done_tx, mut done_rx) = tokio::sync::oneshot::channel::<()>();
+        tokio::spawn(async move {
+            let _ = child.wait().await;
+            let _ = done_tx.send(());
+        });
+        let begun = Instant::now();
+        let status = loop {
+            if let Some(status) = read_status(&dir) {
+                break status;
+            }
+            if !matches!(
+                done_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ) && read_status(&dir).is_none()
+            {
+                let _ = fs::remove_dir_all(&dir);
+                return Err(err(
+                    ErrorKind::Internal,
+                    "the shim exited before it started the program",
+                )
+                .into());
+            }
+            if begun.elapsed() > Duration::from_secs(10) {
+                return Err(err(
+                    ErrorKind::Internal,
+                    format!("the shim of {id} did not start the program within 10 s"),
+                )
+                .into());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        if status.state == State::FailedToStart {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(StartError::Failed(
+                status
+                    .message
+                    .unwrap_or_else(|| "the program did not start".into()),
+            ));
+        }
+        Ok(Started { id, dir })
+    }
+
+    /// Starts a job.
+    ///
+    /// # Errors
+    ///
+    /// When the spec is invalid, too many jobs run, or it cannot start.
+    pub async fn job_start(self: &Arc<Self>, spec: ExecSpec) -> Result<String, Error> {
+        match self.start(spec, Kind::Job).await {
+            Ok(started) => Ok(started.id),
+            Err(StartError::Failed(message)) => Err(err(ErrorKind::NotFound, message)),
+            Err(StartError::Other(e)) => Err(e),
+        }
+    }
+
+    /// Runs `spec` to its end or its timeout.
+    ///
+    /// # Errors
+    ///
+    /// When the spec is invalid, too many jobs run, or the shim vanishes.
+    #[allow(clippy::too_many_lines)]
+    pub async fn exec(self: &Arc<Self>, spec: ExecSpec) -> Result<ExecResult, Error> {
+        let cap = spec.output_cap.unwrap_or(self.config.exec_output_cap);
+        if cap > MAX_OUTPUT_CAP {
+            return Err(err(
+                ErrorKind::TooLarge,
+                format!("output_cap is at most {MAX_OUTPUT_CAP}"),
+            ));
+        }
+        let keep = spec.keep_on_timeout;
+        let timeout = Duration::from_millis(spec.timeout_ms.unwrap_or(self.config.exec_timeout_ms));
+        let begun = Instant::now();
+        let started = match self.start(spec, Kind::Exec).await {
+            Ok(started) => started,
+            Err(StartError::Failed(message)) => {
+                return Ok(ExecResult {
+                    job_id: String::new(),
+                    outcome: Outcome::FailedToStart { message },
+                    stdout: Output::default(),
+                    stderr: Output::default(),
+                    duration_ms: 0,
+                });
+            }
+            Err(StartError::Other(e)) => return Err(e),
+        };
+        let deadline = begun + timeout;
+        // When the shim kills it at the timeout, allow it the grace and a
+        // margin before answering without a final state.
+        let last =
+            deadline + Duration::from_millis(self.config.stop_grace_ms) + Duration::from_secs(10);
+        let dir = started.dir.clone();
+        let outcome = loop {
+            let d = dir.clone();
+            let live =
+                blocking(move || Self::live(&d).map_err(|e| io_error(&e, "reading the job")))
+                    .await?;
+            let status = live.status.as_ref();
+            match (Self::state(&live), status) {
+                (JobState::Running, _) => {
+                    let now = Instant::now();
+                    if (keep && now >= deadline) || now >= last {
+                        break Outcome::TimedOut { killed: false };
+                    }
+                }
+                (JobState::Exited { code }, Some(s)) => {
+                    break if s.timed_out {
+                        Outcome::TimedOut { killed: true }
+                    } else {
+                        Outcome::Exited { code }
+                    };
+                }
+                (JobState::Signaled { signal }, Some(s)) => {
+                    break if s.timed_out {
+                        Outcome::TimedOut { killed: true }
+                    } else {
+                        Outcome::Signaled { signal }
+                    };
+                }
+                _ => {
+                    return Err(err(
+                        ErrorKind::Internal,
+                        format!("the shim of {} vanished without a final state", started.id),
+                    ));
+                }
+            }
+            tokio::time::sleep(POLL).await;
+        };
+        let cap = usize::try_from(cap).unwrap_or(usize::MAX);
+        let d = dir.clone();
+        let (stdout, stderr, status) = blocking(move || {
+            let out = read_log(&d, Stream::Stdout, None, cap)
+                .map_err(|e| io_error(&e, "reading stdout"))?;
+            let err_ = read_log(&d, Stream::Stderr, None, cap)
+                .map_err(|e| io_error(&e, "reading stderr"))?;
+            Ok((out, err_, read_status(&d)))
+        })
+        .await?;
+        let mut stdout = Output {
+            offset: stdout.offset,
+            total: stdout.total,
+            data: stdout.data,
+        };
+        let mut stderr = Output {
+            offset: stderr.offset,
+            total: stderr.total,
+            data: stderr.data,
+        };
+        fit_outputs(&mut stdout, &mut stderr, EXEC_OUTPUT_BUDGET);
+        let duration_ms = match status
+            .as_ref()
+            .and_then(|s| s.ended_at_ms.map(|e| (s.started_at_ms, e)))
+        {
+            Some((start, end))
+                if matches!(
+                    outcome,
+                    Outcome::Exited { .. }
+                        | Outcome::Signaled { .. }
+                        | Outcome::TimedOut { killed: true }
+                ) =>
+            {
+                end.saturating_sub(start)
+            }
+            _ => u64::try_from(begun.elapsed().as_millis()).unwrap_or(u64::MAX),
+        };
+        Ok(ExecResult {
+            job_id: started.id,
+            outcome,
+            stdout,
+            stderr,
+            duration_ms,
+        })
+    }
+
+    /// Waits up to `timeout_ms` (at most 60 s) for the job to end.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an unknown job.
+    pub async fn wait(self: &Arc<Self>, id: String, timeout_ms: u64) -> Result<JobInfo, Error> {
+        let until = Instant::now() + Duration::from_millis(timeout_ms.min(MAX_WAIT_MS));
+        loop {
+            let this = Arc::clone(self);
+            let i = id.clone();
+            let info = blocking(move || this.info(&i)).await?;
+            if info.state != JobState::Running || Instant::now() >= until {
+                return Ok(info);
+            }
+            tokio::time::sleep(POLL.min(until.saturating_duration_since(Instant::now()))).await;
+        }
+    }
+
+    /// A slice of a job's log.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound`, `TooLarge` past [`MAX_DATA`], or an I/O failure.
+    pub fn log_read(
+        &self,
+        id: &str,
+        stream: Stream,
+        offset: Option<u64>,
+        max_len: u32,
+    ) -> Result<LogSlice, Error> {
+        if max_len as usize > MAX_DATA {
+            return Err(err(
+                ErrorKind::TooLarge,
+                format!("max_len is at most {MAX_DATA}"),
+            ));
+        }
+        let dir = self.dir(id)?;
+        let read = read_log(&dir, stream, offset, max_len as usize)
+            .map_err(|e| io_error(&e, "reading the log"))?;
+        let live = Self::live(&dir).map_err(|_| not_found(id))?;
+        Ok(LogSlice {
+            data: read.data,
+            offset: read.offset,
+            total: read.total,
+            first_available: read.first_available,
+            ended: !live.busy && live.status.is_some(),
+        })
+    }
+
+    /// Sends a signal to the job's process group.
+    ///
+    /// # Errors
+    ///
+    /// `InvalidArgument` for an unknown signal, `Conflict` when the job
+    /// has ended.
+    pub fn signal(&self, id: &str, signal: i32) -> Result<(), Error> {
+        let signal = Signal::try_from(signal)
+            .map_err(|_| err(ErrorKind::InvalidArgument, format!("no signal {signal}")))?;
+        let dir = self.dir(id)?;
+        let live = Self::live(&dir).map_err(|_| not_found(id))?;
+        let (JobState::Running, Some(pgid)) = (
+            Self::state(&live),
+            live.status.as_ref().and_then(|s| s.pgid),
+        ) else {
+            return Err(err(ErrorKind::Conflict, format!("job {id} has ended")));
+        };
+        killpg(pid(pgid), signal).map_err(|e| {
+            let mut error = io_error(&io::Error::from(e), "signalling the job");
+            if e == nix::errno::Errno::ESRCH {
+                error.kind = ErrorKind::Conflict;
+            }
+            error
+        })
+    }
+
+    /// Stops the job and everything it started, waiting until all is gone.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an unknown job.
+    pub async fn stop(
+        self: &Arc<Self>,
+        id: String,
+        grace_ms: Option<u64>,
+    ) -> Result<JobInfo, Error> {
+        let dir = self.dir(&id)?;
+        let grace = grace_ms.unwrap_or(self.config.stop_grace_ms);
+        let d = dir.clone();
+        let shim = blocking(move || {
+            let live = Jobs::live(&d).map_err(|e| io_error(&e, "reading the job"))?;
+            let shim = match (&live.status, live.busy) {
+                (Some(s), true) => Some((s.shim_pid, s.shim_start)),
+                _ => None,
+            };
+            if let Some((shim_pid, shim_start)) = shim {
+                if let Some(grace) = grace_ms {
+                    atomic_write(&d.join(STOP), grace.to_string().as_bytes(), 0o600, false)
+                        .map_err(|e| io_error(&e, "writing the stop request"))?;
+                }
+                if procfs::is_same_process(shim_pid, shim_start) {
+                    let _ = kill(pid(shim_pid), Signal::SIGTERM);
+                }
+            }
+            Ok(shim)
+        })
+        .await?;
+        if let Some((shim_pid, shim_start)) = shim {
+            let until = Instant::now() + Duration::from_millis(grace) + Duration::from_secs(30);
+            while Instant::now() < until {
+                let gone = !procfs::is_same_process(shim_pid, shim_start)
+                    || read_status(&dir).is_some_and(|s| s.tree_gone);
+                if gone {
+                    break;
+                }
+                tokio::time::sleep(POLL).await;
+            }
+        }
+        let this = Arc::clone(self);
+        blocking(move || this.info(&id)).await
+    }
+
+    /// Removes a finished job.
+    ///
+    /// # Errors
+    ///
+    /// `Busy` while it runs, `NotFound` for an unknown job.
+    pub fn remove(&self, id: &str) -> Result<(), Error> {
+        let dir = self.dir(id)?;
+        let live = Self::live(&dir).map_err(|_| not_found(id))?;
+        if live.busy {
+            return Err(err(
+                ErrorKind::Busy,
+                format!("job {id} still runs; stop it first"),
+            ));
+        }
+        fs::remove_dir_all(&dir).map_err(|e| io_error(&e, "removing the job"))
+    }
+
+    /// Removes finished jobs past their retention, then the oldest finished
+    /// beyond `max_jobs_kept`. Never a running one. Answers how many it
+    /// removed.
+    pub fn gc(&self) -> usize {
+        let now = now_ms();
+        let mut finished = Vec::new();
+        let mut total = 0u64;
+        for id in self.ids() {
+            let dir = self.root.join(&id);
+            let Ok(live) = Self::live(&dir) else {
+                // No readable spec: a directory the worker died creating.
+                if fs::metadata(&dir)
+                    .and_then(|m| m.modified())
+                    .is_ok_and(|t| t.elapsed().is_ok_and(|e| e > Duration::from_hours(1)))
+                {
+                    let _ = fs::remove_dir_all(&dir);
+                }
+                continue;
+            };
+            total += 1;
+            if live.busy {
+                continue;
+            }
+            let ended = live.status.as_ref().map_or(live.spec.created_at_ms, |s| {
+                s.ended_at_ms.unwrap_or(s.started_at_ms)
+            });
+            finished.push((ended, live.spec.kind, dir));
+        }
+        let mut removed = 0;
+        finished.sort_by_key(|(ended, _, _)| *ended);
+        let mut kept = Vec::new();
+        for (ended, kind, dir) in finished {
+            let hours = match kind {
+                Kind::Exec => self.config.exec_retention_hours,
+                Kind::Job => self.config.job_retention_hours,
+            };
+            if now.saturating_sub(ended) >= hours.saturating_mul(3_600_000) {
+                if fs::remove_dir_all(&dir).is_ok() {
+                    removed += 1;
+                    total -= 1;
+                }
+            } else {
+                kept.push(dir);
+            }
+        }
+        for dir in kept {
+            if total <= self.config.max_jobs_kept {
+                break;
+            }
+            if fs::remove_dir_all(&dir).is_ok() {
+                removed += 1;
+                total -= 1;
+            }
+        }
+        removed
+    }
+}
+
+struct Started {
+    id: String,
+    dir: PathBuf,
+}
+
+enum StartError {
+    /// The program could not be started (its job is removed).
+    Failed(String),
+    Other(Error),
+}
+
+impl From<Error> for StartError {
+    fn from(e: Error) -> Self {
+        Self::Other(e)
+    }
+}
+
+/// Trims the two outputs' data from the front (stderr first) so that
+/// together they fit `budget`, keeping the offsets true.
+fn fit_outputs(stdout: &mut Output, stderr: &mut Output, budget: usize) {
+    let over = (stdout.data.len() + stderr.data.len()).saturating_sub(budget);
+    let from_err = over.min(stderr.data.len());
+    stderr.data.drain(..from_err);
+    stderr.offset += from_err as u64;
+    let from_out = (over - from_err).min(stdout.data.len());
+    stdout.data.drain(..from_out);
+    stdout.offset += from_out as u64;
+}
+
+/// What [`read_log`] read.
+pub struct LogRead {
+    pub data: Vec<u8>,
+    pub offset: u64,
+    pub total: u64,
+    pub first_available: u64,
+}
+
+/// Reads `[offset, offset + max_len)` of a job's stream (the last
+/// `max_len` bytes when `offset` is `None`) across the rotated and the
+/// current file. The files are opened under the shared log lock, so they
+/// agree with the offsets in `status.json` even while the shim rotates.
+///
+/// # Errors
+///
+/// When the lock or a file cannot be opened or read.
+pub fn read_log(
+    dir: &Path,
+    stream: Stream,
+    offset: Option<u64>,
+    max_len: usize,
+) -> io::Result<LogRead> {
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .mode(0o600)
+        .open(dir.join(LOG_LOCK))?;
+    let lock = Flock::lock(lock_file, FlockArg::LockShared).map_err(|(_, e)| io::Error::from(e))?;
+    let status = read_status(dir);
+    let open = |name: &str| match File::open(dir.join(name)) {
+        Ok(f) => Ok(Some(f)),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e),
+    };
+    let current = open(log_name(stream))?;
+    let stream_status = status
+        .as_ref()
+        .map(|s| s.stream(stream).clone())
+        .unwrap_or_default();
+    let previous = if stream_status.previous_start.is_some() {
+        open(rotated_name(stream))?
+    } else {
+        None
+    };
+    drop(lock);
+    let current_start = stream_status.current_start;
+    let current_len = match &current {
+        Some(f) => f.metadata()?.len(),
+        None => 0,
+    };
+    let total = current_start + current_len;
+    let (previous_start, previous_len) = match (&previous, stream_status.previous_start) {
+        (Some(f), Some(start)) => (start, f.metadata()?.len()),
+        _ => (current_start, 0),
+    };
+    let first_available = if previous.is_some() {
+        previous_start
+    } else {
+        current_start
+    };
+    let max = max_len as u64;
+    let start = match offset {
+        None => total.saturating_sub(max).max(first_available),
+        Some(o) => o.clamp(first_available, total),
+    };
+    let end = start.saturating_add(max).min(total);
+    let mut data = Vec::with_capacity(usize::try_from(end - start).unwrap_or(0));
+    let mut read_part = |file: &File, file_start: u64, file_len: u64| -> io::Result<()> {
+        let from = start.max(file_start);
+        let to = end.min(file_start + file_len);
+        if from < to {
+            let mut buf = vec![0u8; usize::try_from(to - from).unwrap_or(0)];
+            file.read_exact_at(&mut buf, from - file_start)?;
+            data.extend_from_slice(&buf);
+        }
+        Ok(())
+    };
+    if let Some(f) = &previous {
+        read_part(f, previous_start, previous_len)?;
+    }
+    if let Some(f) = &current {
+        read_part(f, current_start, current_len)?;
+    }
+    Ok(LogRead {
+        data,
+        offset: start,
+        total,
+        first_available,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ids() {
+        assert!(valid_id("j0123456789abcdef"));
+        assert!(!valid_id("j0123456789abcdeF"));
+        assert!(!valid_id("j../../etc/passwd"));
+        assert!(!valid_id("k0123456789abcdef"));
+    }
+
+    #[test]
+    fn outputs_fit() {
+        let mut out = Output {
+            data: vec![1; 10],
+            offset: 0,
+            total: 10,
+        };
+        let mut err_ = Output {
+            data: vec![2; 10],
+            offset: 5,
+            total: 15,
+        };
+        fit_outputs(&mut out, &mut err_, 14);
+        assert_eq!(err_.data.len(), 4);
+        assert_eq!(err_.offset, 11);
+        assert_eq!(out.data.len(), 10);
+        fit_outputs(&mut out, &mut err_, 3);
+        assert_eq!(err_.data.len(), 0);
+        assert_eq!(out.data.len(), 3);
+        assert_eq!(out.offset, 7);
+    }
+
+    #[test]
+    fn summary() {
+        let argv: Vec<Vec<u8>> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|s| s.as_bytes().to_vec())
+            .collect();
+        assert_eq!(summarize(&argv), "a b c d");
+    }
+}
