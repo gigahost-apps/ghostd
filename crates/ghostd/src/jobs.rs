@@ -679,6 +679,20 @@ impl Jobs {
         offset: Option<u64>,
         max_len: u32,
     ) -> Result<LogSlice, Error> {
+        self.log_read_observed(id, stream, offset, max_len, || {})
+    }
+
+    /// [`Jobs::log_read`], running `between` after it has seen whether the
+    /// job is over and before it reads the log (a test lets the job write
+    /// and end there).
+    fn log_read_observed(
+        &self,
+        id: &str,
+        stream: Stream,
+        offset: Option<u64>,
+        max_len: u32,
+        between: impl FnOnce(),
+    ) -> Result<LogSlice, Error> {
         if max_len as usize > MAX_DATA {
             return Err(err(
                 ErrorKind::TooLarge,
@@ -686,15 +700,20 @@ impl Jobs {
             ));
         }
         let dir = self.dir(id)?;
+        // Whether the job is over, seen BEFORE the log is read: a job that
+        // writes more and ends in between is answered not ended, and never
+        // ended with a total that is not final.
+        let live = Self::live(&dir).map_err(|e| read_error(id, &e))?;
+        let ended = !live.busy && live.status.is_some();
+        between();
         let read = read_log(&dir, stream, offset, max_len as usize)
             .map_err(|e| io_error(&e, "reading the log"))?;
-        let live = Self::live(&dir).map_err(|e| read_error(id, &e))?;
         Ok(LogSlice {
             data: read.data,
             offset: read.offset,
             total: read.total,
             first_available: read.first_available,
-            ended: !live.busy && live.status.is_some(),
+            ended,
         })
     }
 
@@ -1013,6 +1032,54 @@ pub fn read_log(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_log_is_never_called_ended_before_its_total_is_final() {
+        let root = tempfile::tempdir().unwrap();
+        let jobs = Jobs::new(root.path().to_path_buf(), Config::default());
+        let id = "j0000000000000001";
+        let dir = root.path().join(id);
+        fs::create_dir(&dir).unwrap();
+        let spec = SpecFile {
+            created_at_ms: now_ms(),
+            ..SpecFile::default()
+        };
+        fs::write(dir.join(SPEC), serde_json::to_vec(&spec).unwrap()).unwrap();
+        // Its shim runs: this process stands in for it.
+        let me = std::process::id();
+        let mut status = StatusFile {
+            format: FORMAT,
+            shim_pid: me,
+            shim_start: procfs::start_time(me).unwrap(),
+            ..StatusFile::default()
+        };
+        crate::jobfiles::write_status(&dir, &status, false).unwrap();
+        fs::write(dir.join("stdout.log"), b"one\n").unwrap();
+        let slice = jobs
+            .log_read_observed(id, Stream::Stdout, Some(0), 100, || {
+                // The job prints its last line and ends meanwhile.
+                use std::io::Write as _;
+                let mut log = OpenOptions::new()
+                    .append(true)
+                    .open(dir.join("stdout.log"))
+                    .unwrap();
+                log.write_all(b"two\n").unwrap();
+                status.state = State::Exited;
+                status.code = Some(0);
+                status.stdout.total = 8;
+                status.tree_gone = true;
+                crate::jobfiles::write_status(&dir, &status, false).unwrap();
+            })
+            .unwrap();
+        assert!(
+            !slice.ended || slice.total == 8,
+            "ended, but the total {} is not final",
+            slice.total
+        );
+        let last = jobs.log_read(id, Stream::Stdout, Some(0), 100).unwrap();
+        assert!(last.ended);
+        assert_eq!((last.total, last.data.as_slice()), (8, &b"one\ntwo\n"[..]));
+    }
 
     #[test]
     fn ids() {
