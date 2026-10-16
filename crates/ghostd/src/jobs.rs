@@ -16,6 +16,7 @@ use ghostd_protocol::v1::{
 use nix::fcntl::{Flock, FlockArg};
 use nix::sys::signal::{Signal, kill, killpg};
 use nix::unistd::Pid;
+use sha2::{Digest, Sha256};
 
 use crate::config::{Config, MAX_EXEC_TIMEOUT_MS, MAX_OUTPUT_CAP};
 use crate::jobfiles::{
@@ -252,7 +253,13 @@ impl Jobs {
     /// Resolves an [`ExecSpec`] into what the shim runs, writing the stdin
     /// and script files into `dir`.
     #[allow(clippy::too_many_lines)]
-    fn prepare(&self, spec: &ExecSpec, kind: Kind, dir: &Path) -> Result<SpecFile, Error> {
+    fn prepare(
+        &self,
+        spec: &ExecSpec,
+        kind: Kind,
+        dir: &Path,
+        digest: String,
+    ) -> Result<SpecFile, Error> {
         let mut argv: Vec<Vec<u8>> = match &spec.program {
             Program::Argv(argv) => {
                 if argv.first().is_none_or(Vec::is_empty) {
@@ -356,49 +363,96 @@ impl Jobs {
             name: spec.name.clone(),
             summary,
             created_at_ms: now_ms(),
-            spec_sha256: String::new(),
+            spec_sha256: digest,
         })
     }
 
-    /// Starts a shim for `spec` and waits until it has started the program
-    /// (or failed to).
-    async fn start(self: &Arc<Self>, spec: ExecSpec, kind: Kind) -> Result<Started, StartError> {
-        let _guard = self.start_lock.lock().await;
-        let this = Arc::clone(self);
-        let (id, dir) = blocking(move || {
-            let (running, _) = this.counts();
-            if running as u64 >= this.config.max_running_jobs {
+    /// The job a request with a client-chosen ID that exists names: the
+    /// same request again, or a conflict.
+    fn existing(id: &str, dir: PathBuf, kind: Kind, digest: &str) -> Result<Started, Error> {
+        let spec = read_spec(&dir).map_err(|e| {
+            err(
+                ErrorKind::Conflict,
+                format!("job {id} exists but cannot be read ({e}); choose another job_id"),
+            )
+        })?;
+        if spec.kind != kind || spec.spec_sha256 != digest {
+            return Err(err(
+                ErrorKind::Conflict,
+                format!("job {id} exists for another request; choose another job_id"),
+            ));
+        }
+        Ok(Started {
+            id: id.to_string(),
+            dir,
+        })
+    }
+
+    /// Creates the job's directory and spec (or finds the job a repeat
+    /// names).
+    fn create(&self, spec: &ExecSpec, kind: Kind) -> Result<Created, Error> {
+        let digest = spec_digest(spec);
+        if let Some(id) = &spec.job_id {
+            if !valid_id(id) {
                 return Err(err(
-                    ErrorKind::Busy,
-                    format!(
-                        "{running} jobs run, the most allowed (max_running_jobs); stop or wait for one"
-                    ),
+                    ErrorKind::InvalidArgument,
+                    "job_id is `j` and 16 lowercase hex digits",
                 ));
             }
-            let id = format!(
+            let dir = self.root.join(id);
+            if fs::symlink_metadata(&dir).is_ok() {
+                return Self::existing(id, dir, kind, &digest).map(Created::Exists);
+            }
+        }
+        let (running, _) = self.counts();
+        if running as u64 >= self.config.max_running_jobs {
+            return Err(err(
+                ErrorKind::Busy,
+                format!(
+                    "{running} jobs run, the most allowed (max_running_jobs); stop or wait for one"
+                ),
+            ));
+        }
+        let id = match &spec.job_id {
+            Some(id) => id.clone(),
+            None => format!(
                 "j{}",
                 random_hex(8).map_err(|e| io_error(&e, "random bytes"))?
-            );
-            let dir = this.root.join(&id);
-            DirBuilder::new()
-                .mode(0o700)
-                .create(&dir)
-                .map_err(|e| io_error(&e, "creating the job directory"))?;
-            let file = match this.prepare(&spec, kind, &dir) {
-                Ok(file) => file,
-                Err(e) => {
-                    let _ = fs::remove_dir_all(&dir);
-                    return Err(e);
-                }
-            };
-            let bytes = serde_json::to_vec(&file).map_err(|e| err(ErrorKind::Internal, e.to_string()))?;
-            if let Err(e) = atomic_write(&dir.join(SPEC), &bytes, 0o600, true) {
+            ),
+        };
+        let dir = self.root.join(&id);
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&dir)
+            .map_err(|e| io_error(&e, "creating the job directory"))?;
+        let file = match self.prepare(spec, kind, &dir, digest) {
+            Ok(file) => file,
+            Err(e) => {
                 let _ = fs::remove_dir_all(&dir);
-                return Err(io_error(&e, "writing the job's spec"));
+                return Err(e);
             }
-            Ok((id, dir))
-        })
-        .await?;
+        };
+        let bytes =
+            serde_json::to_vec(&file).map_err(|e| err(ErrorKind::Internal, e.to_string()))?;
+        if let Err(e) = atomic_write(&dir.join(SPEC), &bytes, 0o600, true) {
+            let _ = fs::remove_dir_all(&dir);
+            return Err(io_error(&e, "writing the job's spec"));
+        }
+        Ok(Created::New(id, dir))
+    }
+
+    /// Starts a shim for `spec` and waits until it has started the program
+    /// (or failed to). A client-chosen job ID that names a kept job of the
+    /// same request starts nothing: [`StartError::Exists`].
+    async fn start(self: &Arc<Self>, spec: ExecSpec, kind: Kind) -> Result<Started, StartError> {
+        // Held until the shim runs, so that a repeat waits for the first.
+        let _guard = self.start_lock.lock().await;
+        let this = Arc::clone(self);
+        let created = blocking(move || this.create(&spec, kind)).await?;
+        let (id, dir) = match created {
+            Created::New(id, dir) => (id, dir),
+            Created::Exists(started) => return Err(StartError::Exists(started)),
+        };
         let mut command = tokio::process::Command::new("/proc/self/exe");
         command
             .arg0("ghostd")
@@ -463,7 +517,7 @@ impl Jobs {
     /// When the spec is invalid, too many jobs run, or it cannot start.
     pub async fn job_start(self: &Arc<Self>, spec: ExecSpec) -> Result<String, Error> {
         match self.start(spec, Kind::Job).await {
-            Ok(started) => Ok(started.id),
+            Ok(started) | Err(StartError::Exists(started)) => Ok(started.id),
             Err(StartError::Failed(message)) => Err(err(ErrorKind::NotFound, message)),
             Err(StartError::Other(e)) => Err(e),
         }
@@ -483,11 +537,9 @@ impl Jobs {
                 format!("output_cap is at most {MAX_OUTPUT_CAP}"),
             ));
         }
-        let keep = spec.keep_on_timeout;
-        let timeout = Duration::from_millis(spec.timeout_ms.unwrap_or(self.config.exec_timeout_ms));
-        let begun = Instant::now();
         let started = match self.start(spec, Kind::Exec).await {
-            Ok(started) => started,
+            // A repeat of the request waits for the job the first started.
+            Ok(started) | Err(StartError::Exists(started)) => started,
             Err(StartError::Failed(message)) => {
                 return Ok(ExecResult {
                     job_id: String::new(),
@@ -499,12 +551,22 @@ impl Jobs {
             }
             Err(StartError::Other(e)) => return Err(e),
         };
+        let dir = started.dir.clone();
+        let d = dir.clone();
+        let file =
+            blocking(move || read_spec(&d).map_err(|e| io_error(&e, "reading the job's spec")))
+                .await?;
+        let keep = !file.kill_on_timeout;
+        let timeout = Duration::from_millis(file.timeout_ms.unwrap_or(self.config.exec_timeout_ms));
+        // From the job's creation, also when this answers a repeat.
+        let since = Duration::from_millis(now_ms().saturating_sub(file.created_at_ms));
+        let begun = Instant::now()
+            .checked_sub(since)
+            .unwrap_or_else(Instant::now);
         let deadline = begun + timeout;
         // When the shim kills it at the timeout, allow it the grace and a
         // margin before answering without a final state.
-        let last =
-            deadline + Duration::from_millis(self.config.stop_grace_ms) + Duration::from_secs(10);
-        let dir = started.dir.clone();
+        let last = deadline + Duration::from_millis(file.stop_grace_ms) + Duration::from_secs(10);
         let outcome = loop {
             let d = dir.clone();
             let live =
@@ -815,7 +877,27 @@ struct Started {
 enum StartError {
     /// The program could not be started (its job is removed).
     Failed(String),
+    /// The client's job ID names a job of the same request: started before.
+    Exists(Started),
     Other(Error),
+}
+
+/// What the blocking part of [`Jobs::start`] did.
+enum Created {
+    New(String, PathBuf),
+    Exists(Started),
+}
+
+/// The SHA-256 of a request's `ExecSpec` as encoded on the wire, in hex.
+fn spec_digest(spec: &ExecSpec) -> String {
+    use std::fmt::Write as _;
+    let bytes = ghostd_protocol::encode_frame(spec).unwrap_or_default();
+    Sha256::digest(&bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut s, b| {
+            let _ = write!(s, "{b:02x}");
+            s
+        })
 }
 
 impl From<Error> for StartError {

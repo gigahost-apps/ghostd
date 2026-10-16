@@ -360,7 +360,7 @@ async fn a_job_timeout_stops_it() {
 fn age(dir: &std::path::Path) {
     fs::File::open(dir)
         .unwrap()
-        .set_modified(SystemTime::now() - Duration::from_secs(7200))
+        .set_modified(SystemTime::now() - Duration::from_hours(2))
         .unwrap();
 }
 
@@ -414,4 +414,63 @@ async fn job_files_of_another_build_are_read_and_never_collected_blindly() {
         panic!()
     };
     assert_eq!(stopped.state, JobState::Signaled { signal: 15 });
+}
+
+#[tokio::test]
+async fn a_client_chosen_id_makes_a_repeat_safe() {
+    let env = Env::new();
+    let c = env.connect().await;
+    // JobStart twice with the same ID: one job, one run.
+    let mut spec = sh("echo run >> runs; sleep 30");
+    spec.job_id = Some("j0123456789abcdef".into());
+    let first = start(&c, spec.clone()).await;
+    assert_eq!(first, "j0123456789abcdef");
+    assert_eq!(start(&c, spec.clone()).await, first);
+    // Another request under a kept job's ID is refused.
+    let mut other = sh("true");
+    other.job_id = spec.job_id.clone();
+    let e = c.call(Request::JobStart(other)).await.unwrap_err();
+    assert_eq!(remote_kind(&e), ErrorKind::Conflict);
+    let e = c.call(Request::Exec(spec.clone())).await.unwrap_err();
+    assert_eq!(
+        remote_kind(&e),
+        ErrorKind::Conflict,
+        "an Exec of a JobStart's ID"
+    );
+    let mut bad = sh("true");
+    bad.job_id = Some("../../etc".into());
+    let e = c.call(Request::JobStart(bad)).await.unwrap_err();
+    assert_eq!(remote_kind(&e), ErrorKind::InvalidArgument);
+    // An Exec whose answer is lost with its connection: the job is found by
+    // its ID on another one, and the same request answers that run.
+    let mut run = sh("echo x >> execs; sleep 1; echo done");
+    run.job_id = Some("jfedcba9876543210".into());
+    let lost = {
+        let c2 = env.connect().await;
+        let run = run.clone();
+        tokio::spawn(async move { c2.call(Request::Exec(run)).await })
+    };
+    let until = Instant::now() + Duration::from_secs(10);
+    while c
+        .call(Request::JobStatus {
+            job_id: "jfedcba9876543210".into(),
+        })
+        .await
+        .is_err()
+    {
+        assert!(Instant::now() < until, "the exec never started");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    lost.abort();
+    let _ = lost.await;
+    let r = exec(&c, run).await;
+    assert_eq!(r.job_id, "jfedcba9876543210");
+    assert_eq!(
+        r.outcome,
+        ghostd_protocol::v1::Outcome::Exited { code: 0 },
+        "{r:?}"
+    );
+    assert_eq!(r.stdout.data, b"done\n");
+    assert_eq!(fs::read(env.home.join("execs")).unwrap(), b"x\n");
+    assert_eq!(fs::read(env.home.join("runs")).unwrap(), b"run\n");
 }

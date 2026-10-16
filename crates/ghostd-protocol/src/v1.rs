@@ -261,6 +261,14 @@ pub struct ExecSpec {
     /// Exec only: leave the program running as a job at the timeout.
     pub keep_on_timeout: bool,
     pub name: Option<String>,
+    /// The job's ID chosen by the client (`j` and 16 random lowercase hex
+    /// digits), so that it knows the ID before any answer comes: after a
+    /// lost answer it finds the job by it on any connection, and sending
+    /// the same request again starts nothing new (`JobStart` answers the
+    /// job, `Exec` waits for it and answers its result; another request
+    /// under a kept job's ID is refused with `Conflict`). `None`: the
+    /// server chooses.
+    pub job_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

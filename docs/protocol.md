@@ -93,7 +93,7 @@ log slice) is at most 8 MiB.
 ### Programs
 
 `ExecSpec { program, stdin, env, env_remove, env_clear, cwd, login,
-timeout_ms, output_cap, keep_on_timeout, name }`:
+timeout_ms, output_cap, keep_on_timeout, name, job_id }`:
 
 - `program`: `Argv([argv0, args…])` (non-empty; `argv0` without a slash is
   looked up in `$PATH`), or `Script { body, interpreter, args }`: the body
@@ -105,6 +105,8 @@ timeout_ms, output_cap, keep_on_timeout, name }`:
   `[$SHELL, "-lc", "exec \"$0\" \"$@\"", argv…]`, the arguments as
   positional parameters.
 - `stdin`: bytes for the program's stdin, else `/dev/null`.
+- `job_id`: the job's ID chosen by the client, `j` and 16 random lowercase
+  hex digits (else the server chooses one); see [Retries](#retries).
 
 Every program runs as a job under its own shim, in its own process group.
 Stopping one (a stop, a timeout) sends SIGTERM to its group and to every
@@ -135,6 +137,26 @@ To keep a process that is not a daemon running, start it as a job.
 | `JobSignal { job_id, signal }` | `Done` | To the program's process group; `Conflict` when it has ended. |
 | `JobStop { job_id, grace_ms }` | `Job(JobInfo)` | Answers once everything the job started is gone. |
 | `JobRemove { job_id }` | `Done` | `Busy` while it runs. |
+
+### Retries
+
+An answer can be lost: the SSH connection drops, the laptop sleeps. A
+client that wants to take a job up again, or to retry safely, chooses the
+job's ID itself (`job_id`), so it knows the ID before any answer comes.
+Then, on any connection:
+
+- `JobStatus`, `JobWait`, `JobLogRead` or `JobStop` with that ID reach the
+  job; `NotFound` means the request never arrived (or its program failed
+  to start), so it can be sent again.
+- Sending the same request again never runs the program twice: while the
+  job is kept, a `JobStart` answers `JobStarted` with the job, and an
+  `Exec` waits for the job the first one started and answers its result.
+  A different request (or the other kind) under a kept job's ID is
+  refused with `Conflict`. Two requests with one ID never both start: the
+  job's directory is created once.
+
+Once the job is removed (`JobRemove`, or collected after its retention)
+its ID is free again.
 
 ### Files
 
