@@ -207,3 +207,23 @@ async fn a_daemon_whose_socket_is_removed_stops() {
     let c = env.connect().await;
     assert_eq!(c.call(Request::Ping).await.unwrap(), Response::Pong);
 }
+
+#[tokio::test]
+async fn a_cancelled_call_leaves_the_connection_usable() {
+    let env = Env::new();
+    let c = env.connect().await;
+    // An 8 MiB write cut off by a timeout while its frame is being sent.
+    let big = Request::FileWrite {
+        path: b"big".to_vec(),
+        data: vec![7; 8 * 1024 * 1024],
+        mode: None,
+        create_dirs: false,
+    };
+    let cut = tokio::time::timeout(Duration::from_millis(1), c.call(big)).await;
+    assert!(cut.is_err(), "the call finished within 1 ms: {cut:?}");
+    let answer = tokio::time::timeout(Duration::from_secs(10), c.call(Request::Ping))
+        .await
+        .expect("the next call was never answered");
+    assert_eq!(answer.unwrap(), Response::Pong);
+    assert_eq!(c.call(Request::Ping).await.unwrap(), Response::Pong);
+}

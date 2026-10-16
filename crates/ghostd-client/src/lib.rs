@@ -21,7 +21,7 @@ use ghostd_protocol::{
 };
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 /// How much of a spawned command's stderr is kept for error messages.
@@ -111,14 +111,31 @@ struct Pending {
 
 type Writer = Box<dyn AsyncWrite + Send + Unpin>;
 
+/// Frames queued for the writer task.
+const OUTGOING_QUEUE: usize = 16;
+
+/// What the writer task writes.
+enum Outgoing {
+    /// One whole encoded frame.
+    Frame(Vec<u8>),
+    /// Shuts the sending side down after the frames queued before it.
+    Shutdown(oneshot::Sender<std::io::Result<()>>),
+}
+
 /// A connection to a `ghostd`.
+///
+/// Calls are cancel-safe: one writer task writes every frame whole, so a
+/// call dropped halfway (a timeout around it, a cancelled tool call) never
+/// leaves part of a frame on the stream, and its answer, when it comes, is
+/// dropped.
 pub struct Connection {
-    writer: tokio::sync::Mutex<Writer>,
+    outgoing: mpsc::Sender<Outgoing>,
     pending: Arc<Mutex<Pending>>,
     next_id: AtomicU64,
     version: u32,
     server_version: String,
     reader: JoinHandle<()>,
+    writer: JoinHandle<()>,
     child: Option<Child>,
 }
 
@@ -134,6 +151,19 @@ impl std::fmt::Debug for Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         self.reader.abort();
+        self.writer.abort();
+    }
+}
+
+/// Forgets a call's pending entry when the call ends, answered or dropped.
+struct Forget<'a> {
+    pending: &'a Mutex<Pending>,
+    id: u64,
+}
+
+impl Drop for Forget<'_> {
+    fn drop(&mut self) {
+        lock(self.pending).waiting.remove(&self.id);
     }
 }
 
@@ -170,14 +200,17 @@ impl Connection {
         let (version, server_version, decoder) =
             handshake(&mut reader, &mut writer, &options).await?;
         let pending = Arc::new(Mutex::new(Pending::default()));
-        let task = tokio::spawn(read_loop(reader, decoder, Arc::clone(&pending)));
+        let reader = tokio::spawn(read_loop(reader, decoder, Arc::clone(&pending)));
+        let (outgoing, queue) = mpsc::channel(OUTGOING_QUEUE);
+        let writer = tokio::spawn(write_loop(writer, queue, Arc::clone(&pending)));
         Ok(Self {
-            writer: tokio::sync::Mutex::new(writer),
+            outgoing,
             pending,
             next_id: AtomicU64::new(1),
             version,
             server_version,
-            reader: task,
+            reader,
+            writer,
             child: None,
         })
     }
@@ -269,7 +302,9 @@ impl Connection {
     }
 
     /// Sends a request and waits for its answer. Many calls may run at
-    /// once; answers are paired by request ID.
+    /// once; answers are paired by request ID. Dropping the future (a
+    /// timeout) is safe: the request is then either not sent at all or
+    /// sent whole, and the connection stays usable.
     ///
     /// # Errors
     ///
@@ -288,34 +323,84 @@ impl Connection {
             }
             pending.waiting.insert(id, tx);
         }
-        let written = {
-            let mut writer = self.writer.lock().await;
-            match writer.write_all(&frame).await {
-                Ok(()) => writer.flush().await,
-                Err(e) => Err(e),
-            }
+        let _forget = Forget {
+            pending: &self.pending,
+            id,
         };
-        if let Err(e) = written {
-            lock(&self.pending).waiting.remove(&id);
-            return Err(ClientError::Closed(format!("cannot send: {e}")));
+        // A queued frame is written whole by the writer task; a send
+        // cancelled while it waits for room queues nothing.
+        if self.outgoing.send(Outgoing::Frame(frame)).await.is_err() {
+            return Err(self.closed_error());
         }
         match rx.await {
             Ok(Ok(Ok(response))) => Ok(response),
             Ok(Ok(Err(remote))) => Err(ClientError::Remote(remote)),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(ClientError::Closed("the reader stopped".into())),
+            Err(_) => Err(self.closed_error()),
         }
     }
 
-    /// Closes the sending side; the server ends the connection once the
-    /// pending calls are answered.
+    fn closed_error(&self) -> ClientError {
+        ClientError::Closed(
+            lock(&self.pending)
+                .closed
+                .clone()
+                .unwrap_or_else(|| "the connection stopped".into()),
+        )
+    }
+
+    /// Closes the sending side once the requests sent before are written;
+    /// the server ends the connection once the pending calls are answered.
     ///
     /// # Errors
     ///
     /// When the stream cannot be shut down.
     pub async fn shutdown(&self) -> Result<(), ClientError> {
-        self.writer.lock().await.shutdown().await?;
+        let (done, result) = oneshot::channel();
+        if self.outgoing.send(Outgoing::Shutdown(done)).await.is_err() {
+            return Err(self.closed_error());
+        }
+        result.await.map_err(|_| self.closed_error())??;
         Ok(())
+    }
+}
+
+/// Writes the queued frames, each whole, in the order they were queued.
+async fn write_loop(
+    mut writer: Writer,
+    mut queue: mpsc::Receiver<Outgoing>,
+    pending: Arc<Mutex<Pending>>,
+) {
+    while let Some(out) = queue.recv().await {
+        match out {
+            Outgoing::Frame(frame) => {
+                let written = match writer.write_all(&frame).await {
+                    Ok(()) => writer.flush().await,
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = written {
+                    close(&pending, &format!("cannot send: {e}"));
+                    return;
+                }
+            }
+            Outgoing::Shutdown(done) => {
+                let _ = done.send(writer.shutdown().await);
+            }
+        }
+    }
+}
+
+/// Marks the connection closed and fails every pending call.
+fn close(pending: &Mutex<Pending>, reason: &str) {
+    let waiting = {
+        let mut pending = lock(pending);
+        if pending.closed.is_none() {
+            pending.closed = Some(reason.to_string());
+        }
+        std::mem::take(&mut pending.waiting)
+    };
+    for (_, tx) in waiting {
+        let _ = tx.send(Err(ClientError::Closed(reason.to_string())));
     }
 }
 
@@ -473,13 +558,5 @@ async fn read_loop<R: AsyncRead + Unpin>(
             Err(e) => break ClientError::Protocol(e.to_string()),
         }
     };
-    let reason = failure.to_string();
-    let waiting = {
-        let mut pending = lock(&pending);
-        pending.closed = Some(reason.clone());
-        std::mem::take(&mut pending.waiting)
-    };
-    for (_, tx) in waiting {
-        let _ = tx.send(Err(ClientError::Closed(reason.clone())));
-    }
+    close(&pending, &failure.to_string());
 }
