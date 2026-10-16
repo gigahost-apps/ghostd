@@ -5,7 +5,102 @@ argument arrays with structured results, jobs that outlive the connection,
 and file reads, writes and edits, reached over the machine's own SSH with
 no quoting and one kept connection.
 
-Work in progress.
+It is one binary that needs no service manager:
+`ghostd stdio`, the command an SSH key runs, starts the daemon when none
+runs. Jobs run under their own supervisor process, so they survive the
+connection, the daemon's restarts and its crashes, and stopping one kills
+everything it started. See [the protocol](docs/protocol.md).
+
+## Install from source
+
+On the machine (Linux, x86_64 or aarch64), from a checkout:
+
+```sh
+git clone https://github.com/gigahost-apps/ghostd
+sh ghostd/install.sh
+```
+
+or piped from a tag (it builds the latest tag unless `--ref` names one):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/gigahost-apps/ghostd/<tag>/install.sh | sh -s --
+```
+
+`install.sh` needs a C compiler, and curl (or wget) and tar when it
+downloads. It never runs a package manager: when something is missing it
+says what to install. When cargo is missing it installs
+[rustup](https://rustup.rs) for the user, after saying so (`--no-rustup`
+stops instead). It builds with `cargo build --release --locked` on the
+toolchain pinned in `rust-toolchain.toml`, installs
+`~/.local/bin/ghostd` (`/usr/local/bin/ghostd` as root, or `--prefix`),
+then runs `ghostd setup`. Options for `ghostd setup` go after `--`:
+
+```sh
+sh install.sh -- --authorize-key "$(cat agent_key.pub)" --label agent
+```
+
+## Authorize a key
+
+```sh
+ghostd setup --authorize-key "ssh-ed25519 AAAA… agent@laptop" --label agent
+```
+
+adds to `~/.ssh/authorized_keys`:
+
+```
+command="/home/you/.local/bin/ghostd stdio --client agent",restrict ssh-ed25519 AAAA… ghostd:agent
+```
+
+That key then runs only `ghostd`, whatever command the client asks for;
+`restrict` turns off forwarding and terminals. The file is rewritten
+atomically and every other line is kept byte for byte. A key already
+authorized for plain logins is refused unless `--replace` asks to turn it
+into a ghostd-only key (it loses shell access). `ghostd keys list` and
+`ghostd keys remove <label>` only ever touch lines marked `ghostd:<label>`.
+
+## Connect
+
+With a forced-command key, any SSH connection with that key reaches
+`ghostd`: `ssh -T -i agent_key host`. With an ordinary key, run it
+yourself: `ssh -T host ghostd stdio`. Output a login shell prints first is
+skipped: `ghostd` opens with a fixed marker and the client discards what
+comes before it.
+
+From Rust, `ghostd-client`:
+
+```rust
+let c = ghostd_client::Connection::spawn(&["ssh", "-T", "host", "ghostd", "stdio"]).await?;
+let answer = c.call(Request::Exec(ExecSpec {
+    program: Program::Argv(vec![b"ls".to_vec(), b"-la".to_vec()]),
+    ..ExecSpec::default()
+})).await?;
+```
+
+## Commands
+
+| Command | |
+|---|---|
+| `ghostd stdio [--client <label>]` | Relay stdin and stdout to the daemon, starting it when none runs. |
+| `ghostd setup [--authorize-key <key> --label <label> [--replace]]` | Create the directories and a commented configuration file; authorize a key. |
+| `ghostd keys list`, `ghostd keys remove <label>` | The forced-command keys. |
+| `ghostd status` | JSON: whether the daemon runs, its pid and version, the socket, job counts. |
+| `ghostd stop` | Stop the daemon; jobs keep running. The next `ghostd stdio` starts it again. |
+| `ghostd daemon` | Run the supervisor in the foreground of a new session (what `ghostd stdio` starts). |
+| `ghostd --version` | |
+
+## Where things live
+
+| | As a user | As root |
+|---|---|---|
+| State: jobs, logs, `ghostd.log`, `install.json` | `$XDG_STATE_HOME/ghostd` (`~/.local/state/ghostd`) | `/var/lib/ghostd` |
+| Socket, lock and pid file | `$XDG_RUNTIME_DIR/ghostd`, else `<state>/run` | `/run/ghostd` |
+| Configuration | `$XDG_CONFIG_HOME/ghostd/config.toml` (`~/.config/ghostd/config.toml`) | `/etc/ghostd/config.toml` |
+
+`GHOSTD_STATE_DIR`, `GHOSTD_RUNTIME_DIR` and `GHOSTD_CONFIG` override them.
+The directories are 0700 and the socket 0600, and the daemon accepts only
+connections from its own user. One daemon runs per user, as that user; jobs
+run as that user. `ghostd setup` writes the configuration file with every
+key and its default, commented out.
 
 ## License
 

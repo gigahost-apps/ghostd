@@ -1,0 +1,24 @@
+[package]
+name = "ghostd-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+ghostd-protocol = { path = "../crates/ghostd-protocol" }
+
+[[bin]]
+name = "frames"
+path = "fuzz_targets/frames.rs"
+test = false
+doc = false
+bench = false
+
+# Not a member of the main workspace.
+[workspace]
+members = ["."]
