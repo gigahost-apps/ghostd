@@ -168,6 +168,10 @@ impl Jobs {
         match &live.status {
             None if live.busy => JobState::Running,
             None => JobState::Lost,
+            // Its shim is gone before the job finished, also when the
+            // program had ended: what it left may still run, and nothing
+            // watches or stops it any more.
+            Some(s) if !live.busy && !s.tree_gone => JobState::Lost,
             Some(s) => match s.state {
                 State::Running if live.busy => JobState::Running,
                 State::Running | State::FailedToStart => JobState::Lost,
@@ -635,7 +639,11 @@ impl Jobs {
                 _ => {
                     return Err(err(
                         ErrorKind::Internal,
-                        format!("the shim of {} vanished without a final state", started.id),
+                        format!(
+                            "the shim of {} vanished before the job finished; what it left may \
+                             still run",
+                            started.id
+                        ),
                     ));
                 }
             }

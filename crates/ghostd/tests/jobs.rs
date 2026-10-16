@@ -296,6 +296,47 @@ async fn a_killed_shim_is_lost_and_nothing_is_killed_for_it() {
 }
 
 #[tokio::test]
+async fn a_shim_killed_while_the_job_keeps_what_its_program_left_is_lost() {
+    let env = Env::new();
+    let c = env.connect().await;
+    let job = start(&c, sh("nohup sleep 304 >/dev/null 2>&1 &")).await;
+    let until = Instant::now() + Duration::from_secs(10);
+    loop {
+        let info = status(&c, &job).await;
+        if info.state == (JobState::Exited { code: 0 }) && info.processes == 1 {
+            assert!(!info.finished);
+            break;
+        }
+        assert!(Instant::now() < until, "{info:?}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let shim = env.processes("shim");
+    assert_eq!(shim.len(), 1);
+    signal(shim[0], 9);
+    wait_gone(shim[0]);
+    // Its program's end is known, but not that nothing is left of it.
+    let info = status(&c, &job).await;
+    assert_eq!(info.state, JobState::Lost, "{info:?}");
+    assert!(info.finished);
+    let Response::Job(after) = c
+        .call(Request::JobStop {
+            job_id: job.clone(),
+            grace_ms: Some(10),
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(after.state, JobState::Lost);
+    let server = env.processes("304");
+    assert_eq!(server.len(), 1, "a lost job's leftover was killed");
+    signal(server[0], 9);
+    wait_gone(server[0]);
+    c.call(Request::JobRemove { job_id: job }).await.unwrap();
+}
+
+#[tokio::test]
 async fn gc_keeps_running_jobs() {
     let env =
         Env::with_config("stop_grace_ms = 300\nmax_jobs_kept = 1\nexec_retention_hours = 0\n");

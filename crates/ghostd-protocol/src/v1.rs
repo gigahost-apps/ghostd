@@ -356,7 +356,9 @@ pub enum JobState {
     Signaled {
         signal: i32,
     },
-    /// Its shim is gone without a final state; nothing is killed for it.
+    /// Its shim is gone before the job finished, also after the program
+    /// ended: what is left of the job may still run, and nothing watches,
+    /// stops or kills it any more.
     Lost,
 }
 
