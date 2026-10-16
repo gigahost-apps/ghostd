@@ -176,12 +176,20 @@ fi
 
 if [ -z "$src" ]; then
     if [ -z "$ref" ]; then
-        if fetch "$API_URL/tags" "$tmp/tags.json"; then
-            ref=$(sed -n 's/.*"name": *"\([A-Za-z0-9._/-]*\)".*/\1/p' "$tmp/tags.json" | head -n 1)
-        fi
+        # Only an answer that lists no tag at all means main; a failed call
+        # (GitHub allows 60 unauthenticated API calls an hour per address,
+        # which a shared or NAT address may have used up) never does.
+        fetch "$API_URL/tags" "$tmp/tags.json" ||
+            die "cannot list the release tags from GitHub's API (its limit is 60 calls an hour per address without a token): pass --ref <tag>, the latest from https://github.com/gigahost-apps/ghostd/tags"
+        # One field per line first, so that the first tag's name is taken
+        # however the JSON is laid out.
+        ref=$(tr ',{}' '\n\n\n' <"$tmp/tags.json" |
+            sed -n 's/^[[:space:]]*"name":[[:space:]]*"\([A-Za-z0-9._/-]*\)"[[:space:]]*$/\1/p' | head -n 1)
         if [ -z "$ref" ]; then
+            [ "$(tr -d ' \t\r\n' <"$tmp/tags.json")" = "[]" ] ||
+                die "cannot read the release tags GitHub's API answered: pass --ref <tag>"
             ref=main
-            say "no release tag found: building main"
+            say "the repository has no release tag yet: building main"
         fi
     fi
     commit=""

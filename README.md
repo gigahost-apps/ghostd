@@ -21,7 +21,9 @@ git clone https://github.com/gigahost-apps/ghostd
 sh ghostd/install.sh
 ```
 
-or piped from a tag (it builds the latest tag unless `--ref` names one):
+or piped from a tag (it builds the latest tag unless `--ref` names one;
+when GitHub's API cannot be asked for the tags, it stops and asks for
+`--ref`):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/gigahost-apps/ghostd/<tag>/install.sh | sh -s --
