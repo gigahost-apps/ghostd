@@ -25,6 +25,36 @@ jobs:
       - name: SSH test
         run: cargo test -p ghostd --test ssh -- --ignored
 
+  # The binary every install path ships: static, for musl, on both
+  # architectures, and the tests run against it.
+  musl:
+    strategy:
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: rustup when the image has none
+        run: |
+          if ! command -v rustup >/dev/null; then
+            curl -fsSL --proto '=https' --tlsv1.2 https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+      - name: Toolchain and the musl target
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup target add "$(uname -m)-unknown-linux-musl"
+      - name: Static release build
+        run: cargo build --release --locked -p ghostd --target "$(uname -m)-unknown-linux-musl"
+      - name: Statically linked
+        run: |
+          bin="target/$(uname -m)-unknown-linux-musl/release/ghostd"
+          file "$bin"
+          file "$bin" | grep -Eq 'static(ally|-pie) linked'
+          "$bin" --version
+      - name: Tests on musl
+        run: cargo test --workspace --target "$(uname -m)-unknown-linux-musl"
+
   install-script:
     runs-on: ubuntu-latest
     steps:

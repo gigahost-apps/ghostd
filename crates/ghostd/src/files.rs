@@ -571,15 +571,17 @@ pub fn rename(from: &[u8], to: &[u8], overwrite: bool) -> Result<Response, Error
         fs::rename(&from, &to).map_err(|e| io_error(&e, &context()))?;
         return Ok(Response::Done);
     }
-    match nix::fcntl::renameat2(
-        nix::fcntl::AT_FDCWD,
+    // rustix makes the system call itself: nix has renameat2 only on glibc,
+    // and ghostd is built for musl too.
+    match rustix::fs::renameat_with(
+        rustix::fs::CWD,
         &from,
-        nix::fcntl::AT_FDCWD,
+        rustix::fs::CWD,
         &to,
-        nix::fcntl::RenameFlags::RENAME_NOREPLACE,
+        rustix::fs::RenameFlags::NOREPLACE,
     ) {
         Ok(()) => Ok(Response::Done),
-        Err(nix::errno::Errno::EINVAL | nix::errno::Errno::ENOSYS) => {
+        Err(rustix::io::Errno::INVAL | rustix::io::Errno::NOSYS) => {
             // A file system without RENAME_NOREPLACE.
             if fs::symlink_metadata(&to).is_ok() {
                 return Err(err(

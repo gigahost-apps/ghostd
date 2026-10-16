@@ -33,8 +33,11 @@ curl -fsSL https://raw.githubusercontent.com/gigahost-apps/ghostd/<tag>/install.
 downloads. It never runs a package manager: when something is missing it
 says what to install. When cargo is missing it installs
 [rustup](https://rustup.rs) for the user, after saying so (`--no-rustup`
-stops instead). It builds with `cargo build --release --locked` on the
-toolchain pinned in `rust-toolchain.toml`, installs
+stops instead). It builds a static binary for musl
+(`<arch>-unknown-linux-musl`, the target added through rustup), as CI does,
+with `cargo build --release --locked` on the toolchain pinned in
+`rust-toolchain.toml` (a Rust without rustup and without that target
+builds for the host's C library, and says so), installs
 `~/.local/bin/ghostd` (`/usr/local/bin/ghostd` as root, or `--prefix`),
 then runs `ghostd setup`. Options for `ghostd setup` go after `--`:
 

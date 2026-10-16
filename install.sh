@@ -10,8 +10,9 @@
 #   --no-rustup                fail instead of installing rustup when cargo is missing
 #
 # It never runs a package manager: when something is missing it says what
-# to install and stops. It builds with the toolchain pinned in
-# rust-toolchain.toml and removes its temporary files when it ends.
+# to install and stops. It builds a static (musl) binary with the toolchain
+# pinned in rust-toolchain.toml and removes its temporary files when it
+# ends.
 
 set -eu
 
@@ -229,8 +230,28 @@ else
     say "no rustup: building with $(cargo --version 2>/dev/null || printf 'cargo') (ghostd needs Rust 1.97 or newer)"
 fi
 
-(cd "$src" && CARGO_TARGET_DIR="$tmp/target" cargo build --release --locked -p ghostd) ||
-    die "the build failed"
+# A static binary (musl), as CI and the release channel build it, so that
+# it runs whatever the machine's C library becomes.
+case "$arch" in
+    x86_64 | amd64) triple=x86_64-unknown-linux-musl ;;
+    *) triple=aarch64-unknown-linux-musl ;;
+esac
+if have rustup; then
+    (cd "$src" && rustup target add "$triple" >/dev/null) ||
+        die "rustup cannot add the $triple target"
+elif ! [ -d "$(rustc --print sysroot 2>/dev/null)/lib/rustlib/$triple" ]; then
+    say "this Rust has no $triple target and no rustup to add it: building for the host's C library instead"
+    triple=""
+fi
+if [ -n "$triple" ]; then
+    (cd "$src" && CARGO_TARGET_DIR="$tmp/target" cargo build --release --locked -p ghostd --target "$triple") ||
+        die "the build failed"
+    binary="$tmp/target/$triple/release/ghostd"
+else
+    (cd "$src" && CARGO_TARGET_DIR="$tmp/target" cargo build --release --locked -p ghostd) ||
+        die "the build failed"
+    binary="$tmp/target/release/ghostd"
+fi
 
 if [ -z "$prefix" ]; then
     if [ "$(id -u)" -eq 0 ]; then
@@ -240,7 +261,7 @@ if [ -z "$prefix" ]; then
     fi
 fi
 mkdir -p "$prefix/bin" || die "cannot create $prefix/bin"
-cp "$tmp/target/release/ghostd" "$prefix/bin/ghostd.new" || die "cannot write $prefix/bin"
+cp "$binary" "$prefix/bin/ghostd.new" || die "cannot write $prefix/bin"
 chmod 755 "$prefix/bin/ghostd.new"
 mv -f "$prefix/bin/ghostd.new" "$prefix/bin/ghostd"
 say "installed $prefix/bin/ghostd"
