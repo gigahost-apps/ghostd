@@ -17,7 +17,7 @@ use nix::fcntl::{Flock, FlockArg};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 
 use crate::config::Config;
 use crate::files::{self, SearchSpec, Uploads};
@@ -376,6 +376,25 @@ async fn connection(stream: UnixStream, shared: Arc<Shared>) {
     let label = relay.client_label.clone().unwrap_or_else(|| "-".into());
     let in_flight = Arc::new(Semaphore::new(MAX_IN_FLIGHT));
     let uploads = Arc::new(Uploads::default());
+    // An upload's chunks, its end and its abort are carried out one at a
+    // time in the order they arrive, so that a client may send the chunks
+    // without waiting for each answer. Everything else runs concurrently.
+    let (upload_tx, mut upload_rx) =
+        mpsc::channel::<(u64, Request, OwnedSemaphorePermit)>(MAX_IN_FLIGHT);
+    let upload_task = {
+        let tx = tx.clone();
+        let shared = Arc::clone(&shared);
+        let uploads = Arc::clone(&uploads);
+        tokio::spawn(async move {
+            while let Some((id, request, permit)) = upload_rx.recv().await {
+                let result = handle(&shared, &uploads, request).await;
+                let _ = tx
+                    .send(Outgoing::Frame(ServerFrame::Response { id, result }))
+                    .await;
+                drop(permit);
+            }
+        })
+    };
     loop {
         let body = match read_frame(&mut reader, &mut decoder, &mut buf).await {
             Ok(Some(body)) => body,
@@ -405,6 +424,14 @@ async fn connection(stream: UnixStream, shared: Arc<Shared>) {
             let _ = tx.send(Outgoing::Frame(busy)).await;
             continue;
         };
+        if matches!(
+            request,
+            Request::UploadChunk { .. } | Request::UploadEnd { .. } | Request::UploadAbort { .. }
+        ) {
+            // The permits bound the queue: this never waits.
+            let _ = upload_tx.send((id, request, permit)).await;
+            continue;
+        }
         let tx = tx.clone();
         let shared = Arc::clone(&shared);
         let uploads = Arc::clone(&uploads);
@@ -417,8 +444,10 @@ async fn connection(stream: UnixStream, shared: Arc<Shared>) {
         });
     }
     // Answer what is in flight, then close.
+    drop(upload_tx);
     let all = u32::try_from(MAX_IN_FLIGHT).unwrap_or(u32::MAX);
     let _ = in_flight.acquire_many(all).await;
+    let _ = upload_task.await;
     drop(tx);
     let _ = writer_task.await;
     drop(uploads);

@@ -2,7 +2,9 @@
 //!
 //! Every frame from the client is a [`ClientFrame`], every frame from the
 //! server a [`ServerFrame`]. Requests run concurrently on the server and
-//! their responses may come back in any order; the `id` pairs them.
+//! their responses may come back in any order; the `id` pairs them. Only
+//! an upload's chunks, end and abort run one at a time, in the order they
+//! arrive, so that chunks may be sent without waiting for each answer.
 //!
 //! Everything a Unix system may hold as non-UTF-8 bytes (arguments,
 //! environment names and values, paths, file contents, output) is bytes

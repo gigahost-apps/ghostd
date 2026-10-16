@@ -682,3 +682,57 @@ async fn a_replaced_file_keeps_its_group_and_attributes() {
         eprintln!("attributes not checked: the file system takes no user attributes");
     }
 }
+
+#[tokio::test]
+async fn an_upload_may_send_its_chunks_without_waiting() {
+    let env = Env::new();
+    let c = std::sync::Arc::new(env.connect().await);
+    let Response::Upload { handle } = call(
+        &c,
+        Request::UploadBegin {
+            path: b"big".to_vec(),
+            mode: None,
+            create_dirs: false,
+        },
+    )
+    .await
+    else {
+        panic!()
+    };
+    let chunk = 256 * 1024;
+    let data: Vec<u8> = (0..16 * chunk)
+        .map(|i| u8::try_from(i % 251).unwrap())
+        .collect();
+    // All chunks at once, in order, each answer awaited only afterwards.
+    let sent: Vec<_> = data
+        .chunks(chunk)
+        .enumerate()
+        .map(|(i, part)| {
+            let c = std::sync::Arc::clone(&c);
+            let request = Request::UploadChunk {
+                handle,
+                offset: (i * chunk) as u64,
+                data: part.to_vec(),
+            };
+            tokio::spawn(async move { c.call(request).await })
+        })
+        .collect();
+    let end = {
+        let c = std::sync::Arc::clone(&c);
+        tokio::spawn(async move {
+            c.call(Request::UploadEnd {
+                handle,
+                sha256: Some(Sha256::digest(&data).into()),
+            })
+            .await
+        })
+    };
+    for (i, answer) in sent.into_iter().enumerate() {
+        assert_eq!(answer.await.unwrap().unwrap(), Response::Done, "chunk {i}");
+    }
+    let Response::Written { size, .. } = end.await.unwrap().unwrap() else {
+        panic!()
+    };
+    assert_eq!(size, (16 * chunk) as u64);
+    assert_eq!(fs::read(env.home.join("big")).unwrap().len(), 16 * chunk);
+}

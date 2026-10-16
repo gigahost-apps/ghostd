@@ -75,7 +75,10 @@ This build speaks version 1 only.
 The client sends `ClientFrame::Request { id: u64, body: Request }`; the
 server answers `ServerFrame::Response { id, result: Result<Response,
 Error> }`. Requests run concurrently and answers may come in any order: the
-`id` pairs them. At most 64 requests are in flight per connection; more
+`id` pairs them. The one exception is uploads: `UploadChunk`, `UploadEnd`
+and `UploadAbort` run one at a time in the order they arrive on the
+connection, so a client may send an upload's chunks without waiting for
+each answer. At most 64 requests are in flight per connection; more
 are answered `Busy`. A frame the server cannot decode is answered
 `ServerFrame::ProtocolError { message }` and the connection is closed.
 
@@ -166,7 +169,7 @@ its ID is free again.
 | `FileRead { path, offset, len }` | `FileData { data, size, eof }` | `len` at most 8 MiB. |
 | `FileWrite { path, data, mode, create_dirs }` | `Written { size, sha256 }` | Atomic: a temp file beside it, fsync, rename. Keeps an existing file's mode unless `mode` (new files 0644) and, as far as the daemon's user may, its owner, group, SELinux label, ACL and `user.*` attributes; a hard link to the old file keeps the old content. Writes through a symlink to its target. |
 | `UploadBegin { path, mode, create_dirs }` | `Upload { handle }` | At most 16 open per connection. |
-| `UploadChunk { handle, offset, data }` | `Done` | Offsets contiguous, else `InvalidArgument`. |
+| `UploadChunk { handle, offset, data }` | `Done` | Offsets contiguous, else `InvalidArgument`; carried out in the order they arrive. |
 | `UploadEnd { handle, sha256 }` | `Written { size, sha256 }` | Checks the hash when given (`Conflict` and discarded on a mismatch), then renames into place atomically, keeping what `FileWrite` keeps. |
 | `UploadAbort { handle }` | `Done` | An unfinished upload's temp file is also removed when the connection ends. |
 | `FileEdit { path, old, new, replace_all }` | `Edited { replacements, sha256 }` | `NotFound` when `old` is absent, `Conflict` when it occurs more than once without `replace_all`. Atomic, keeping what `FileWrite` keeps. |
