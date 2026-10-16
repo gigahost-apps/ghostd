@@ -386,6 +386,37 @@ async fn listings() {
 }
 
 #[tokio::test]
+async fn a_listing_with_an_unreadable_entry_is_not_complete() {
+    if nix::unistd::geteuid().is_root() {
+        eprintln!("skipped: root reads every directory");
+        return;
+    }
+    let env = Env::new();
+    let c = env.connect().await;
+    let root = env.home.join("shut");
+    fs::create_dir_all(root.join("box")).unwrap();
+    fs::write(root.join("box/inside"), b"x").unwrap();
+    // Readable but not searchable: the names list, their stat fails.
+    fs::set_permissions(root.join("box"), fs::Permissions::from_mode(0o444)).unwrap();
+    let answer = call(
+        &c,
+        Request::FileList {
+            path: b"shut".to_vec(),
+            depth: 2,
+            max_entries: 0,
+        },
+    )
+    .await;
+    fs::set_permissions(root.join("box"), fs::Permissions::from_mode(0o755)).unwrap();
+    let Response::Listing { entries, truncated } = answer else {
+        panic!()
+    };
+    assert!(entries.iter().any(|(n, _)| n == b"box"));
+    assert!(!entries.iter().any(|(n, _)| n == b"box/inside"));
+    assert!(truncated);
+}
+
+#[tokio::test]
 async fn searches() {
     let env = Env::new();
     let c = env.connect().await;

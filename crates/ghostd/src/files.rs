@@ -370,6 +370,9 @@ impl Walk {
             }
             let path = dir.join(&name);
             let Ok(meta) = fs::symlink_metadata(&path) else {
+                // An entry that cannot be read (a directory readable but not
+                // searchable): the listing is not complete.
+                self.truncated = true;
                 continue;
             };
             let mut rel = prefix.to_vec();

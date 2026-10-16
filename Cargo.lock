@@ -306,7 +306,7 @@ dependencies = [
 
 [[package]]
 name = "ghostd"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "clap",
@@ -329,7 +329,7 @@ dependencies = [
 
 [[package]]
 name = "ghostd-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "ghostd-protocol",
  "thiserror",
@@ -338,7 +338,7 @@ dependencies = [
 
 [[package]]
 name = "ghostd-protocol"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "postcard",
  "serde",

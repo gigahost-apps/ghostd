@@ -267,8 +267,14 @@ say "installed $prefix/bin/ghostd"
 
 "$prefix/bin/ghostd" setup --origin source --ref "$ref" --commit "$commit"
 
+# A daemon that runs keeps the old binary: stop it, so the next
+# `ghostd stdio` starts the new one. Jobs keep running; clients reconnect.
 if "$prefix/bin/ghostd" status 2>/dev/null | grep -q '"running":true'; then
-    say "a ghostd daemon runs: the new binary takes effect after \`ghostd stop\` (the next \`ghostd stdio\` starts it again)"
+    if "$prefix/bin/ghostd" stop >/dev/null 2>&1; then
+        say "stopped the running ghostd daemon: the next connection starts the new one (jobs keep running)"
+    else
+        say "could not stop the running ghostd daemon: run \`ghostd stop\` for the new binary to take effect"
+    fi
 fi
 case ":$PATH:" in
     *":$prefix/bin:"*) ;;
