@@ -41,8 +41,8 @@ use signal_hook::consts::{SIGCHLD, SIGHUP, SIGINT, SIGTERM};
 use signal_hook::iterator::Signals;
 
 use crate::jobfiles::{
-    self, LOG_LOCK, STDIN, STOP, SpecFile, State, StatusFile, StreamStatus, log_name, rotated_name,
-    write_status,
+    self, FORMAT, LOG_LOCK, STDIN, STOP, SpecFile, State, StatusFile, StreamStatus, log_name,
+    rotated_name, write_status,
 };
 use crate::procfs;
 use crate::util::now_ms;
@@ -110,6 +110,7 @@ pub fn run(dir: &Path) -> ExitCode {
     // Ours since the setsid above; the session the job's processes share.
     let session = nix::unistd::getsid(None).map_or(me, |s| u32::try_from(s.as_raw()).unwrap_or(me));
     let mut status = StatusFile {
+        format: FORMAT,
         state: State::Running,
         code: None,
         signal: None,

@@ -19,8 +19,8 @@ use nix::unistd::Pid;
 
 use crate::config::{Config, MAX_EXEC_TIMEOUT_MS, MAX_OUTPUT_CAP};
 use crate::jobfiles::{
-    Kind, LOG_LOCK, SCRIPT, SPEC, STDIN, STOP, SpecFile, State, StatusFile, log_name, read_spec,
-    read_status, rotated_name,
+    FORMAT, Kind, LOG_LOCK, SCRIPT, SPEC, STATUS, STDIN, STOP, SpecFile, State, StatusFile,
+    log_name, read_spec, read_status, read_status_checked, rotated_name,
 };
 use crate::procfs;
 use crate::util::{B64, atomic_write, err, io_error, now_ms, random_hex, resolve};
@@ -29,6 +29,9 @@ use crate::util::{B64, atomic_write, err, io_error, now_ms, random_hex, resolve}
 const MAX_WAIT_MS: u64 = 60_000;
 /// A job directory without a status this old is a shim that never started.
 const STARTING_GRACE_MS: u64 = 30_000;
+/// A job directory with neither a spec nor a status this old is one the
+/// worker died creating (no shim ever started for it).
+const ABANDONED_AFTER: Duration = Duration::from_hours(1);
 /// What an exec's two outputs may take of a frame, leaving room for the rest.
 const EXEC_OUTPUT_BUDGET: usize = ghostd_protocol::MAX_FRAME - 64 * 1024;
 /// How often job state is polled.
@@ -58,6 +61,16 @@ fn valid_id(id: &str) -> bool {
 
 fn not_found(id: &str) -> Error {
     err(ErrorKind::NotFound, format!("no job {id}"))
+}
+
+/// A job directory that cannot be read: gone meanwhile, or written by
+/// another ghostd in a format this one does not know.
+fn read_error(id: &str, e: &io::Error) -> Error {
+    if e.kind() == io::ErrorKind::NotFound {
+        not_found(id)
+    } else {
+        io_error(e, &format!("reading job {id}"))
+    }
 }
 
 fn blocking_error(e: &tokio::task::JoinError) -> Error {
@@ -122,9 +135,12 @@ impl Jobs {
         }
     }
 
+    /// Reads a job's files. A status that exists but cannot be read is an
+    /// error, never "no status": a job is only ever taken for finished on
+    /// what its own status says.
     fn live(dir: &Path) -> io::Result<Live> {
         let spec = read_spec(dir)?;
-        let mut status = read_status(dir);
+        let mut status = read_status_checked(dir)?;
         let busy = match &status {
             None => now_ms().saturating_sub(spec.created_at_ms) < STARTING_GRACE_MS,
             Some(s) if s.tree_gone => false,
@@ -133,7 +149,7 @@ impl Jobs {
                 if !alive {
                     // It may have written its final state just before
                     // exiting: read again.
-                    status = read_status(dir);
+                    status = read_status_checked(dir)?;
                 }
                 alive
             }
@@ -180,7 +196,7 @@ impl Jobs {
     /// `NotFound` for an unknown job.
     pub fn info(&self, id: &str) -> Result<JobInfo, Error> {
         let dir = self.dir(id)?;
-        let live = Self::live(&dir).map_err(|_| not_found(id))?;
+        let live = Self::live(&dir).map_err(|e| read_error(id, &e))?;
         Ok(Self::info_of(id, &live))
     }
 
@@ -321,6 +337,7 @@ impl Jobs {
                 .map_err(|e| io_error(&e, "writing stdin"))?;
         }
         Ok(SpecFile {
+            format: FORMAT,
             kind,
             argv: argv.into_iter().map(B64).collect(),
             env: spec
@@ -339,6 +356,7 @@ impl Jobs {
             name: spec.name.clone(),
             summary,
             created_at_ms: now_ms(),
+            spec_sha256: String::new(),
         })
     }
 
@@ -608,7 +626,7 @@ impl Jobs {
         let dir = self.dir(id)?;
         let read = read_log(&dir, stream, offset, max_len as usize)
             .map_err(|e| io_error(&e, "reading the log"))?;
-        let live = Self::live(&dir).map_err(|_| not_found(id))?;
+        let live = Self::live(&dir).map_err(|e| read_error(id, &e))?;
         Ok(LogSlice {
             data: read.data,
             offset: read.offset,
@@ -628,7 +646,7 @@ impl Jobs {
         let signal = Signal::try_from(signal)
             .map_err(|_| err(ErrorKind::InvalidArgument, format!("no signal {signal}")))?;
         let dir = self.dir(id)?;
-        let live = Self::live(&dir).map_err(|_| not_found(id))?;
+        let live = Self::live(&dir).map_err(|e| read_error(id, &e))?;
         let (JobState::Running, Some(pgid)) = (
             Self::state(&live),
             live.status.as_ref().and_then(|s| s.pgid),
@@ -657,8 +675,9 @@ impl Jobs {
         let dir = self.dir(&id)?;
         let grace = grace_ms.unwrap_or(self.config.stop_grace_ms);
         let d = dir.clone();
+        let id_ = id.clone();
         let shim = blocking(move || {
-            let live = Jobs::live(&d).map_err(|e| io_error(&e, "reading the job"))?;
+            let live = Jobs::live(&d).map_err(|e| read_error(&id_, &e))?;
             let shim = match (&live.status, live.busy) {
                 (Some(s), true) => Some((s.shim_pid, s.shim_start)),
                 _ => None,
@@ -697,7 +716,7 @@ impl Jobs {
     /// `Busy` while it runs, `NotFound` for an unknown job.
     pub fn remove(&self, id: &str) -> Result<(), Error> {
         let dir = self.dir(id)?;
-        let live = Self::live(&dir).map_err(|_| not_found(id))?;
+        let live = Self::live(&dir).map_err(|e| read_error(id, &e))?;
         if live.busy {
             return Err(err(
                 ErrorKind::Busy,
@@ -708,23 +727,26 @@ impl Jobs {
     }
 
     /// Removes finished jobs past their retention, then the oldest finished
-    /// beyond `max_jobs_kept`. Never a running one. Answers how many it
-    /// removed.
-    pub fn gc(&self) -> usize {
+    /// beyond `max_jobs_kept`. Never a running one, and never one it cannot
+    /// read (another ghostd's format): only a status saying it is over, or
+    /// a shim that is gone, makes a job finished.
+    pub fn gc(&self) -> Collected {
         let now = now_ms();
         let mut finished = Vec::new();
         let mut total = 0u64;
+        let mut unreadable = Vec::new();
         for id in self.ids() {
             let dir = self.root.join(&id);
-            let Ok(live) = Self::live(&dir) else {
-                // No readable spec: a directory the worker died creating.
-                if fs::metadata(&dir)
-                    .and_then(|m| m.modified())
-                    .is_ok_and(|t| t.elapsed().is_ok_and(|e| e > Duration::from_hours(1)))
-                {
-                    let _ = fs::remove_dir_all(&dir);
+            let live = match Self::live(&dir) {
+                Ok(live) => live,
+                Err(e) => {
+                    if abandoned(&dir) {
+                        let _ = fs::remove_dir_all(&dir);
+                    } else if e.kind() != io::ErrorKind::NotFound || dir.join(SPEC).exists() {
+                        unreadable.push(format!("{id} ({e})"));
+                    }
+                    continue;
                 }
-                continue;
             };
             total += 1;
             if live.busy {
@@ -761,8 +783,28 @@ impl Jobs {
                 total -= 1;
             }
         }
-        removed
+        Collected {
+            removed,
+            unreadable,
+        }
     }
+}
+
+/// What [`Jobs::gc`] did.
+pub struct Collected {
+    pub removed: usize,
+    /// The jobs it left because it cannot read them, with why.
+    pub unreadable: Vec<String>,
+}
+
+/// A directory the worker died creating: neither a spec nor a status (so
+/// no shim ever ran for it), untouched for an hour.
+fn abandoned(dir: &Path) -> bool {
+    !dir.join(SPEC).exists()
+        && !dir.join(STATUS).exists()
+        && fs::metadata(dir)
+            .and_then(|m| m.modified())
+            .is_ok_and(|t| t.elapsed().is_ok_and(|e| e > ABANDONED_AFTER))
 }
 
 struct Started {

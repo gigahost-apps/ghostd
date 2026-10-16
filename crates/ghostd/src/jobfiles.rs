@@ -5,6 +5,14 @@
 //! `stdout.log` / `stderr.log` and one rotated `.1` each, `log.lock` (held
 //! exclusively by the shim while it rotates, shared by readers while they
 //! open the logs) and `stop` (the grace a stop asks for).
+//!
+//! Jobs outlive the binary that started them (an update, a rollback), so
+//! one ghostd reads the files of a newer or an older one: readers ignore
+//! fields they do not know and default the ones that are missing, so a
+//! field is only ever added, with a default that means what older files
+//! meant. A change older readers would misread instead raises [`FORMAT`];
+//! a reader leaves a job of a newer format alone (it never stops or
+//! collects it).
 
 use std::fs;
 use std::io;
@@ -22,17 +30,27 @@ pub const SCRIPT: &str = "script";
 pub const STOP: &str = "stop";
 pub const LOG_LOCK: &str = "log.lock";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// The format of `spec.json` and `status.json` this build writes.
+pub const FORMAT: u32 = 1;
+
+fn first_format() -> u32 {
+    1
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Kind {
     Exec,
+    #[default]
     Job,
 }
 
 /// What the shim runs, everything resolved by the worker.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SpecFile {
+    #[serde(default = "first_format")]
+    pub format: u32,
     pub kind: Kind,
     pub argv: Vec<B64>,
     pub env: Vec<(B64, B64)>,
@@ -49,11 +67,15 @@ pub struct SpecFile {
     pub name: Option<String>,
     pub summary: String,
     pub created_at_ms: u64,
+    /// The SHA-256 of the request's `ExecSpec` (hex), to tell a repeat of
+    /// a request with a client-chosen job ID from another request.
+    pub spec_sha256: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum State {
+    #[default]
     Running,
     Exited,
     Signaled,
@@ -61,6 +83,7 @@ pub enum State {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StreamStatus {
     /// Every byte the stream produced (and the log kept).
     pub total: u64,
@@ -70,8 +93,11 @@ pub struct StreamStatus {
     pub previous_start: Option<u64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub struct StatusFile {
+    #[serde(default = "first_format")]
+    pub format: u32,
     pub state: State,
     pub code: Option<i32>,
     pub signal: Option<i32>,
@@ -124,10 +150,36 @@ pub fn rotated_name(stream: Stream) -> &'static str {
     }
 }
 
+fn newer(what: &str, format: u32) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("{what} has format {format}, newer than this ghostd's {FORMAT}"),
+    )
+}
+
+/// Reads `status.json`: `None` when there is none (yet).
+///
+/// # Errors
+///
+/// When it exists but cannot be read or parsed, or is of a newer format.
+pub fn read_status_checked(dir: &Path) -> io::Result<Option<StatusFile>> {
+    let bytes = match fs::read(dir.join(STATUS)) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let status: StatusFile = serde_json::from_slice(&bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{STATUS}: {e}")))?;
+    if status.format > FORMAT {
+        return Err(newer(STATUS, status.format));
+    }
+    Ok(Some(status))
+}
+
+/// Reads `status.json`, `None` when it is missing or unreadable.
 #[must_use]
 pub fn read_status(dir: &Path) -> Option<StatusFile> {
-    let bytes = fs::read(dir.join(STATUS)).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    read_status_checked(dir).ok().flatten()
 }
 
 /// Replaces `status.json` atomically.
@@ -144,8 +196,54 @@ pub fn write_status(dir: &Path, status: &StatusFile, sync: bool) -> io::Result<(
 ///
 /// # Errors
 ///
-/// When it cannot be read or parsed.
+/// When it cannot be read or parsed, or is of a newer format.
 pub fn read_spec(dir: &Path) -> io::Result<SpecFile> {
     let bytes = fs::read(dir.join(SPEC))?;
-    serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+    let spec: SpecFile = serde_json::from_slice(&bytes)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("{SPEC}: {e}")))?;
+    if spec.format > FORMAT {
+        return Err(newer(SPEC, spec.format));
+    }
+    Ok(spec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn files_of_other_versions_are_read() {
+        let dir = tempfile::tempdir().unwrap();
+        // A newer build's fields are ignored, missing ones defaulted.
+        fs::write(
+            dir.path().join(SPEC),
+            br#"{"kind":"exec","argv":["c2g="],"cwd":"Lw==","created_at_ms":5,"added_later":{"x":1}}"#,
+        )
+        .unwrap();
+        let spec = read_spec(dir.path()).unwrap();
+        assert_eq!(spec.format, 1);
+        assert_eq!(spec.kind, Kind::Exec);
+        assert_eq!(spec.argv, vec![B64(b"sh".to_vec())]);
+        assert_eq!(spec.created_at_ms, 5);
+        fs::write(
+            dir.path().join(STATUS),
+            br#"{"state":"exited","code":3,"shim_pid":7,"tree_gone":true,"stdout":{"total":9,"new":0},"new":[]}"#,
+        )
+        .unwrap();
+        let status = read_status_checked(dir.path()).unwrap().unwrap();
+        assert_eq!(status.state, State::Exited);
+        assert_eq!(status.code, Some(3));
+        assert_eq!(status.stdout.total, 9);
+        assert!(status.tree_gone);
+        // A newer format is refused; a broken file is an error, not "none".
+        fs::write(dir.path().join(STATUS), br#"{"format":2}"#).unwrap();
+        assert_eq!(
+            read_status_checked(dir.path()).unwrap_err().kind(),
+            io::ErrorKind::Unsupported
+        );
+        fs::write(dir.path().join(STATUS), b"{").unwrap();
+        assert!(read_status_checked(dir.path()).is_err());
+        fs::remove_file(dir.path().join(STATUS)).unwrap();
+        assert!(read_status_checked(dir.path()).unwrap().is_none());
+    }
 }

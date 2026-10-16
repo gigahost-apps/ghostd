@@ -160,10 +160,23 @@ async fn serve(shared: Arc<Shared>) -> ExitCode {
         tokio::spawn(async move {
             loop {
                 let j = Arc::clone(&jobs);
-                if let Ok(removed) = tokio::task::spawn_blocking(move || j.gc()).await
-                    && removed > 0
-                {
-                    log(&paths, &format!("worker: removed {removed} finished jobs"));
+                if let Ok(collected) = tokio::task::spawn_blocking(move || j.gc()).await {
+                    if collected.removed > 0 {
+                        log(
+                            &paths,
+                            &format!("worker: removed {} finished jobs", collected.removed),
+                        );
+                    }
+                    if !collected.unreadable.is_empty() {
+                        log(
+                            &paths,
+                            &format!(
+                                "worker: left {} job directories it cannot read: {}",
+                                collected.unreadable.len(),
+                                collected.unreadable.join(", ")
+                            ),
+                        );
+                    }
                 }
                 tokio::time::sleep(GC_EVERY).await;
             }

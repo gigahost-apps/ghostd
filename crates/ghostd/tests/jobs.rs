@@ -4,7 +4,8 @@
 
 mod common;
 
-use std::time::{Duration, Instant};
+use std::fs;
+use std::time::{Duration, Instant, SystemTime};
 
 use common::{Env, alive, exec, sh, signal, start, status, wait_gone, wait_job};
 use ghostd_client::Connection;
@@ -353,4 +354,64 @@ async fn a_job_timeout_stops_it() {
         wait_job(&c, &job).await.state,
         JobState::Signaled { signal: 15 }
     );
+}
+
+/// Sets a directory's mtime two hours back.
+fn age(dir: &std::path::Path) {
+    fs::File::open(dir)
+        .unwrap()
+        .set_modified(SystemTime::now() - Duration::from_secs(7200))
+        .unwrap();
+}
+
+#[tokio::test]
+async fn job_files_of_another_build_are_read_and_never_collected_blindly() {
+    let env = Env::new();
+    let c = env.connect().await;
+    let job = start(&c, sh("sleep 60")).await;
+    drop(c);
+    env.stop();
+    // A newer build wrote fields this one does not know (or an older one
+    // lacks some): the job is still read, running, and stoppable.
+    let dir = env.job_dir(&job);
+    for name in ["spec.json", "status.json"] {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir.join(name)).unwrap()).unwrap();
+        value["added_by_a_newer_build"] = serde_json::json!({"x": 1});
+        fs::write(dir.join(name), serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    // One whose spec this build cannot read at all, and one the worker
+    // died creating (neither spec nor status), both two hours old.
+    let foreign = env.state.join("jobs/j00000000000000aa");
+    fs::create_dir(&foreign).unwrap();
+    fs::write(foreign.join("spec.json"), b"{\"format\": 7}").unwrap();
+    let abandoned = env.state.join("jobs/j00000000000000bb");
+    fs::create_dir(&abandoned).unwrap();
+    for d in [&dir, &foreign, &abandoned] {
+        age(d);
+    }
+    // The next worker collects at its start.
+    let c = env.connect().await;
+    env.wait_for("the abandoned directory to go", || !abandoned.exists());
+    assert!(dir.exists(), "a running job was collected");
+    assert!(foreign.exists(), "a job of another format was collected");
+    assert_eq!(status(&c, &job).await.state, JobState::Running);
+    let e = c
+        .call(Request::JobStatus {
+            job_id: "j00000000000000aa".into(),
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(remote_kind(&e), ErrorKind::Unsupported);
+    let Response::Job(stopped) = c
+        .call(Request::JobStop {
+            job_id: job,
+            grace_ms: None,
+        })
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(stopped.state, JobState::Signaled { signal: 15 });
 }

@@ -121,6 +121,7 @@ pub fn io_error(e: &io::Error, context: &str) -> Error {
         io::ErrorKind::InvalidInput | io::ErrorKind::InvalidData => ErrorKind::InvalidArgument,
         io::ErrorKind::DirectoryNotEmpty => ErrorKind::Conflict,
         io::ErrorKind::ResourceBusy => ErrorKind::Busy,
+        io::ErrorKind::Unsupported => ErrorKind::Unsupported,
         _ => ErrorKind::Io,
     };
     Error {
