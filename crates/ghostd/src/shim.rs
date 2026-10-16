@@ -130,6 +130,10 @@ pub fn run(dir: &Path) -> ExitCode {
     };
     let program = child.id();
     let started = Instant::now();
+    // The program holds its stdin open; the bytes need not stay on disk.
+    if spec.stdin {
+        let _ = fs::remove_file(dir.join(STDIN));
+    }
     status.pid = Some(program);
     status.pgid = Some(program);
     status.started_at_ms = now_ms();

@@ -3,7 +3,7 @@
 //! without losing one.
 
 use std::fs::{self, OpenOptions};
-use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -28,6 +28,11 @@ use crate::util::err;
 
 /// Requests in flight on one connection; more are answered `Busy`.
 pub const MAX_IN_FLIGHT: usize = 64;
+/// Answers queued for a connection's writer; a client that does not read
+/// holds up its own handlers, not the daemon's memory.
+const OUTGOING_QUEUE: usize = 16;
+/// How often the worker checks that its socket is still the one it bound.
+const SOCKET_CHECK: Duration = Duration::from_secs(10);
 /// How long a connection may take to say hello.
 const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often finished jobs are collected.
@@ -141,6 +146,10 @@ async fn serve(shared: Arc<Shared>) -> ExitCode {
         }
     };
     let _ = fs::set_permissions(&socket, fs::Permissions::from_mode(0o600));
+    let bound = fs::symlink_metadata(&socket)
+        .map(|m| (m.dev(), m.ino()))
+        .ok();
+    let mut socket_check = tokio::time::interval(SOCKET_CHECK);
     log(
         &shared.paths,
         &format!("worker: serving {}", socket.display()),
@@ -185,6 +194,17 @@ async fn serve(shared: Arc<Shared>) -> ExitCode {
                 }
             },
             _ = term.recv() => break,
+            _ = socket_check.tick() => {
+                // The runtime directory can be removed under us (a login
+                // manager clears $XDG_RUNTIME_DIR when the last session
+                // ends) or the socket replaced: a daemon nobody can reach
+                // stops instead of lingering beside the next one.
+                let now = fs::symlink_metadata(&socket).map(|m| (m.dev(), m.ino())).ok();
+                if now != bound {
+                    log(&shared.paths, &format!("worker: {} is gone or replaced; stopping", socket.display()));
+                    return ExitCode::SUCCESS;
+                }
+            }
         }
     }
     let _ = fs::remove_file(&socket);
@@ -304,7 +324,7 @@ async fn connection(stream: UnixStream, shared: Arc<Shared>) {
     // agreed version here.
     debug_assert_eq!(version, v1::VERSION);
     decoder.set_max(MAX_FRAME);
-    let (tx, mut rx) = mpsc::channel::<Outgoing>(MAX_IN_FLIGHT * 2);
+    let (tx, mut rx) = mpsc::channel::<Outgoing>(OUTGOING_QUEUE);
     let writer_task = tokio::spawn(async move {
         while let Some(out) = rx.recv().await {
             let (frame, fatal) = match out {

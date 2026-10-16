@@ -123,6 +123,10 @@ async fn stdin_env_and_cwd() {
     )
     .await;
     assert_eq!(r.stdout.data, b"in\0put\xff");
+    assert!(
+        !env.job_dir(&r.job_id).join("stdin").exists(),
+        "stdin stayed on disk"
+    );
     let mut spec = sh("printf '%s|%s' \"$FOO\" \"${HOME-unset}\"");
     spec.env = vec![(b"FOO".to_vec(), b"b a r".to_vec())];
     spec.env_remove = vec![b"HOME".to_vec()];

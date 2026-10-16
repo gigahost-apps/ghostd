@@ -188,3 +188,22 @@ fn status_reports_the_daemon() {
     assert_eq!(v["stopped"], true);
     assert!(env.processes("daemon").is_empty());
 }
+
+#[tokio::test]
+async fn a_daemon_whose_socket_is_removed_stops() {
+    let env = Env::new();
+    let c = env.connect().await;
+    assert_eq!(c.call(Request::Ping).await.unwrap(), Response::Pong);
+    drop(c);
+    let daemon = env.processes("daemon");
+    assert_eq!(daemon.len(), 1);
+    std::fs::remove_file(env.runtime.join("ghostd.sock")).unwrap();
+    let until = std::time::Instant::now() + Duration::from_secs(20);
+    while common::alive(daemon[0]) {
+        assert!(std::time::Instant::now() < until, "the daemon lingers");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // The next relay starts a fresh one.
+    let c = env.connect().await;
+    assert_eq!(c.call(Request::Ping).await.unwrap(), Response::Pong);
+}
