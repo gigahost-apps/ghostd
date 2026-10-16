@@ -1,6 +1,6 @@
 //! Process facts from `/proc`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
@@ -60,35 +60,41 @@ struct Entry {
     zombie: bool,
 }
 
+/// A process's parent, group, session and whether it is a zombie.
+fn entry(pid: u32) -> Option<Entry> {
+    let fields = stat_fields(pid)?;
+    Some(Entry {
+        ppid: fields.get(1)?.parse().ok()?,
+        pgid: fields.get(2)?.parse().ok()?,
+        sid: fields.get(3)?.parse().ok()?,
+        zombie: fields.first().is_some_and(|s| s == "Z"),
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// How often this thread read every process's entry.
+    pub static FULL_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Every process's parent, group, session and whether it is a zombie.
 fn table() -> HashMap<u32, Entry> {
+    #[cfg(test)]
+    FULL_READS.with(|n| n.set(n.get() + 1));
     let mut map = HashMap::new();
     let Ok(entries) = fs::read_dir("/proc") else {
         return map;
     };
-    for entry in entries.flatten() {
-        let Some(pid) = entry
+    for dirent in entries.flatten() {
+        let Some(pid) = dirent
             .file_name()
             .to_str()
             .and_then(|n| n.parse::<u32>().ok())
         else {
             continue;
         };
-        if let Some(fields) = stat_fields(pid)
-            && let Some(ppid) = fields.get(1).and_then(|p| p.parse::<u32>().ok())
-            && let Some(pgid) = fields.get(2).and_then(|p| p.parse::<u32>().ok())
-            && let Some(sid) = fields.get(3).and_then(|p| p.parse::<u32>().ok())
-        {
-            let zombie = fields.first().is_some_and(|s| s == "Z");
-            map.insert(
-                pid,
-                Entry {
-                    ppid,
-                    pgid,
-                    sid,
-                    zombie,
-                },
-            );
+        if let Some(entry) = entry(pid) {
+            map.insert(pid, entry);
         }
     }
     map
@@ -113,7 +119,7 @@ pub fn descendants(root: u32) -> Vec<Descendant> {
         children.entry(entry.ppid).or_default().push(pid);
     }
     let mut out = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let mut stack = vec![root];
     while let Some(pid) = stack.pop() {
         if let Some(kids) = children.get(&pid) {
@@ -131,6 +137,67 @@ pub fn descendants(root: u32) -> Vec<Descendant> {
                     stack.push(kid);
                 }
             }
+        }
+    }
+    out
+}
+
+/// Whether the kernel lists each thread's children in
+/// `/proc/<pid>/task/<tid>/children` (`CONFIG_PROC_CHILDREN`, which the
+/// common distributions' kernels have).
+#[must_use]
+pub fn has_children_lists() -> bool {
+    let me = std::process::id();
+    Path::new(&format!("/proc/{me}/task/{me}/children")).exists()
+}
+
+/// Adds the children of every thread of `pid` to `out`.
+fn children(pid: u32, out: &mut Vec<u32>) {
+    let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) else {
+        return;
+    };
+    for task in tasks.flatten() {
+        if let Ok(list) = fs::read_to_string(task.path().join("children")) {
+            out.extend(
+                list.split_ascii_whitespace()
+                    .filter_map(|p| p.parse::<u32>().ok()),
+            );
+        }
+    }
+}
+
+/// The processes below `root`, zombies left out, found by reading the
+/// children lists down from `root`: it reads the subtree only, where
+/// [`descendants`] reads every process on the machine. The kernel does
+/// not promise a list is complete while processes come and go, so this is
+/// for counting: never conclude from it that nothing is left. Empty
+/// without [`has_children_lists`].
+#[must_use]
+pub fn subtree(root: u32) -> Vec<Descendant> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    let mut stack = vec![root];
+    let mut kids = Vec::new();
+    while let Some(parent) = stack.pop() {
+        kids.clear();
+        children(parent, &mut kids);
+        for &kid in &kids {
+            if kid == root || !seen.insert(kid) {
+                continue;
+            }
+            // Its parent now: a process that ended meanwhile may have
+            // left its pid to an unrelated one.
+            let Some(entry) = entry(kid).filter(|e| e.ppid == parent) else {
+                continue;
+            };
+            if !entry.zombie {
+                out.push(Descendant {
+                    pid: kid,
+                    pgid: entry.pgid,
+                    sid: entry.sid,
+                });
+            }
+            stack.push(kid);
         }
     }
     out
@@ -161,5 +228,43 @@ mod tests {
         );
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    #[test]
+    fn the_subtree_has_what_the_full_scan_finds() {
+        if !has_children_lists() {
+            eprintln!("skipped: this kernel has no /proc/<pid>/task/<tid>/children");
+            return;
+        }
+        let mut shell = std::process::Command::new("sh")
+            .args(["-c", "sleep 7 & sleep 7 & wait"])
+            .spawn()
+            .unwrap();
+        let pid = shell.id();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while descendants(pid).len() < 2 {
+            assert!(
+                std::time::Instant::now() < until,
+                "the shell started no two"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let mut by_table = descendants(pid);
+        let mut by_children = subtree(pid);
+        by_table.sort_by_key(|d| d.pid);
+        by_children.sort_by_key(|d| d.pid);
+        assert_eq!(by_children, by_table);
+        assert_eq!(by_table.len(), 2);
+        // From further up too: the shell and both of its children.
+        let ours = subtree(std::process::id());
+        assert!(ours.iter().any(|d| d.pid == pid));
+        assert!(by_table.iter().all(|d| ours.contains(d)));
+        for d in &by_table {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(i32::try_from(d.pid).unwrap()),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+        shell.wait().unwrap();
     }
 }

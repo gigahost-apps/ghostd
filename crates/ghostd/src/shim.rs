@@ -89,8 +89,17 @@ impl Shared {
 pub const SETTLE: Duration = Duration::from_millis(500);
 
 /// How often the shim counts the job's processes while nothing is being
-/// stopped (each count reads `/proc`).
+/// stopped. A count reads the job's own subtree in `/proc` (the children
+/// lists), so its cost is that of the job's processes, not of every
+/// process on the machine. On a kernel without the lists it reads every
+/// process, and then the interval doubles up to [`COUNT_EVERY_MOST`] while
+/// the count does not change (once the program ended, a child's end still
+/// counts again after [`COUNT_AFTER_CHILD`]).
 const COUNT_EVERY: Duration = Duration::from_secs(1);
+
+/// The longest interval between two counts on a kernel without the
+/// children lists.
+const COUNT_EVERY_MOST: Duration = Duration::from_secs(30);
 
 /// How soon after a child's end (SIGCHLD) the shim counts again, while it
 /// waits for what a job's program left: the last one ending finishes the
@@ -235,18 +244,11 @@ pub fn run(dir: &Path) -> ExitCode {
         session,
         program,
         program_alive: true,
+        children_lists: procfs::has_children_lists(),
         exit: None,
         stop: None,
         leftovers: None,
-        count: Count {
-            next: Instant::now(),
-            at: Instant::now(),
-            child_ended: false,
-            last: Progress {
-                below: 1,
-                waiting: 1,
-            },
-        },
+        count: Count::new(),
     };
     let mut exit_seen: Option<Instant> = None;
     let mut final_written = false;
@@ -431,9 +433,27 @@ struct Progress {
 struct Count {
     next: Instant,
     at: Instant,
+    /// The interval to the next count.
+    every: Duration,
     /// A child ended since the last count.
     child_ended: bool,
     last: Progress,
+}
+
+impl Count {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            next: now,
+            at: now,
+            every: COUNT_EVERY,
+            child_ended: false,
+            last: Progress {
+                below: 1,
+                waiting: 1,
+            },
+        }
+    }
 }
 
 struct Supervise<'a> {
@@ -446,6 +466,8 @@ struct Supervise<'a> {
     /// Until we reap the program its pid (and so its group id) cannot be
     /// reused, so signalling the group is safe exactly while this is true.
     program_alive: bool,
+    /// The kernel lists each thread's children ([`procfs::subtree`]).
+    children_lists: bool,
     exit: Option<(State, Option<i32>, Option<i32>, u64)>,
     /// A stop of the whole tree (a `JobStop`, a timeout).
     stop: Option<StopState>,
@@ -533,6 +555,28 @@ impl Supervise<'_> {
         }
     }
 
+    /// The processes below us and the ones in the job's session, for a
+    /// count while nothing is being stopped: read down our own subtree,
+    /// which costs what the job's processes do. A children list can miss a
+    /// process while others come and go, so when that finds none left in
+    /// the job's session after the program ended (which finishes a job),
+    /// the full [`Self::scan`] decides.
+    fn count_scan(&self) -> (usize, Vec<procfs::Descendant>) {
+        if self.children_lists {
+            let below = procfs::subtree(self.me);
+            let in_session: Vec<procfs::Descendant> = below
+                .iter()
+                .copied()
+                .filter(|d| d.sid == self.session)
+                .collect();
+            if self.program_alive || !in_session.is_empty() {
+                return (below.len(), in_session);
+            }
+        }
+        let (below, in_session) = self.scan();
+        (below.len(), in_session)
+    }
+
     /// Records how many processes are in the job's session: the ones
     /// found there, and the program while it runs (also before it is
     /// seen, as a zombie not yet reaped).
@@ -615,19 +659,26 @@ impl Supervise<'_> {
                 && self.count.child_ended
                 && now >= self.count.at + COUNT_AFTER_CHILD);
         if due {
-            let (descendants, in_session) = self.scan();
+            let (below, in_session) = self.count_scan();
             self.record(&in_session);
-            self.count.child_ended = false;
-            self.count.at = now;
-            self.count.next = now + COUNT_EVERY;
             let in_session_count = in_session.len()
                 + usize::from(
                     self.program_alive && !in_session.iter().any(|d| d.pid == self.program),
                 );
-            self.count.last = Progress {
-                below: descendants.len() + program,
+            let counted = Progress {
+                below: below + program,
                 waiting: in_session_count,
             };
+            self.count.every = if self.children_lists || counted.waiting != self.count.last.waiting
+            {
+                COUNT_EVERY
+            } else {
+                (self.count.every * 2).min(COUNT_EVERY_MOST)
+            };
+            self.count.child_ended = false;
+            self.count.at = now;
+            self.count.next = now + self.count.every;
+            self.count.last = counted;
         }
         if self.program_alive {
             // While it runs, the program is what we wait for.
@@ -765,4 +816,91 @@ fn rotate(shared: &Shared, stream: Stream, file: &mut Option<File>) -> bool {
     shared.write(false);
     drop(lock);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shared(dir: &Path) -> Shared {
+        Shared {
+            dir: dir.to_path_buf(),
+            status: Mutex::new(StatusFile::default()),
+            dirty: AtomicBool::new(false),
+            log_max: 1 << 20,
+        }
+    }
+
+    /// A supervisor of `program` for this process standing in for the
+    /// shim, in a session no process has.
+    fn supervise(shared: &Shared, program: u32) -> Supervise<'_> {
+        Supervise {
+            shared,
+            me: std::process::id(),
+            session: u32::MAX,
+            program,
+            program_alive: true,
+            children_lists: true,
+            exit: None,
+            stop: None,
+            leftovers: None,
+            count: Count::new(),
+        }
+    }
+
+    fn full_reads() -> usize {
+        procfs::FULL_READS.with(std::cell::Cell::get)
+    }
+
+    #[test]
+    fn a_count_reads_the_jobs_subtree_and_every_process_only_to_finish() {
+        if !procfs::has_children_lists() {
+            eprintln!("skipped: this kernel has no /proc/<pid>/task/<tid>/children");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(dir.path());
+        let mut program = Command::new("sleep").arg("30").spawn().unwrap();
+        let mut supervise = supervise(&shared, program.id());
+        // While the program runs, every count reads only our subtree.
+        let before = full_reads();
+        for _ in 0..3 {
+            supervise.count.next = Instant::now();
+            assert_eq!(supervise.progress().waiting, 1);
+        }
+        assert_eq!(full_reads(), before, "a count read every process");
+        assert_eq!(shared.status().processes, 1);
+        program.kill().unwrap();
+        program.wait().unwrap();
+        // Once it ended, none left in the session is decided by reading
+        // every process (twice: a fork can hide a child from one pass).
+        supervise.program_alive = false;
+        supervise.count.next = Instant::now();
+        assert_eq!(supervise.progress().waiting, 0);
+        assert_eq!(full_reads(), before + 2);
+        assert_eq!(shared.status().processes, 0);
+    }
+
+    #[test]
+    fn without_children_lists_an_unchanged_count_backs_off() {
+        let dir = tempfile::tempdir().unwrap();
+        let shared = shared(dir.path());
+        let mut program = Command::new("sleep").arg("30").spawn().unwrap();
+        let mut supervise = supervise(&shared, program.id());
+        supervise.children_lists = false;
+        let mut intervals = Vec::new();
+        for _ in 0..8 {
+            supervise.count.next = Instant::now();
+            assert_eq!(supervise.progress().waiting, 1);
+            intervals.push(supervise.count.every.as_secs());
+        }
+        assert_eq!(intervals, [2, 4, 8, 16, 30, 30, 30, 30]);
+        // A change counts again soon.
+        program.kill().unwrap();
+        program.wait().unwrap();
+        supervise.program_alive = false;
+        supervise.count.next = Instant::now();
+        assert_eq!(supervise.progress().waiting, 0);
+        assert_eq!(supervise.count.every, COUNT_EVERY);
+    }
 }
