@@ -46,6 +46,8 @@ fn is_key_type(token: &str) -> bool {
 /// One authorized key line, parsed.
 #[derive(Debug, PartialEq, Eq)]
 struct KeyLine {
+    /// The options field as it is (`from="…",no-pty`), empty when none.
+    options: String,
     key_type: String,
     base64: String,
     comment: String,
@@ -92,10 +94,11 @@ fn parse_line(line: &str) -> Option<KeyLine> {
         return None;
     }
     let first = line.split_whitespace().next()?;
-    let rest = if is_key_type(first) {
-        line
+    let (options, rest) = if is_key_type(first) {
+        ("", line)
     } else {
-        skip_options(line)?.trim_start()
+        let rest = skip_options(line)?;
+        (&line[..line.len() - rest.len()], rest.trim_start())
     };
     let mut parts = rest.splitn(3, [' ', '\t']);
     let key_type = parts.next()?;
@@ -108,6 +111,7 @@ fn parse_line(line: &str) -> Option<KeyLine> {
     }
     let comment = parts.next().unwrap_or("").trim().to_string();
     Some(KeyLine {
+        options: options.to_string(),
         key_type: key_type.to_string(),
         base64: base64.to_string(),
         comment,
@@ -138,10 +142,63 @@ fn parse_public_key(text: &str) -> Result<KeyLine, String> {
         return Err("the key's data does not match its type".into());
     }
     Ok(KeyLine {
+        options: String::new(),
         key_type: key_type.to_string(),
         base64: base64.to_string(),
         comment: String::new(),
     })
+}
+
+/// An options field's options (`a,b="x,y",c`), split at unquoted commas.
+fn split_options(field: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut start = 0;
+    for (i, c) in field.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' if quoted => escaped = true,
+            '"' => quoted = !quoted,
+            ',' if !quoted => {
+                out.push(&field[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    out.push(&field[start..]);
+    out.retain(|o| !o.is_empty());
+    out
+}
+
+/// The options of a line ours replaces that ours keeps: the ones that
+/// restrict the key (`from=`, `expiry-time=`, `principals=`, `no-*`,
+/// `verify-required`…). Not `command=` and `restrict`, which ours sets,
+/// and not the ones that would give back what `restrict` takes away.
+fn carried_options(field: &str) -> Vec<&str> {
+    const DROPPED: &[&str] = &[
+        "command",
+        "restrict",
+        "agent-forwarding",
+        "port-forwarding",
+        "pty",
+        "user-rc",
+        "x11-forwarding",
+        "permitopen",
+        "permitlisten",
+        "tunnel",
+    ];
+    split_options(field)
+        .into_iter()
+        .filter(|option| {
+            let name = option.split('=').next().unwrap_or("").trim();
+            !DROPPED.iter().any(|d| d.eq_ignore_ascii_case(name))
+        })
+        .collect()
 }
 
 /// The fingerprint as `ssh-keygen -l` prints it: `SHA256:<base64>`.
@@ -235,8 +292,24 @@ fn authorize_content(
     command: &str,
     replace_plain: bool,
 ) -> Result<(Vec<u8>, Authorized), String> {
+    // The line ours replaces keeps its restrictions (a `from=` must never
+    // be lost): those of the same key's line, else of the label's.
+    let lines: Vec<KeyLine> = split_lines(existing)
+        .into_iter()
+        .filter_map(parse_bytes)
+        .collect();
+    let source = lines
+        .iter()
+        .find(|l| l.same_key(key))
+        .or_else(|| lines.iter().find(|l| l.ghostd_label() == Some(label)));
+    let extra: String = source
+        .map(|l| carried_options(&l.options))
+        .unwrap_or_default()
+        .iter()
+        .flat_map(|o| [",", o])
+        .collect();
     let line = format!(
-        "command=\"{command} stdio --client {label}\",restrict {} {} ghostd:{label}",
+        "command=\"{command} stdio --client {label}\",restrict{extra} {} {} ghostd:{label}",
         key.key_type, key.base64
     );
     let mut out: Vec<u8> = Vec::with_capacity(existing.len() + line.len() + 1);
@@ -522,6 +595,53 @@ mod tests {
         // A file without a final newline gets one before our line.
         let (joined, _) = authorize_content(b"# x", &a, "x", "/bin/ghostd", false).unwrap();
         assert!(joined.starts_with(b"# x\ncommand="));
+    }
+
+    #[test]
+    fn restrictions_of_a_replaced_line_are_kept() {
+        let k = key(4);
+        let a = parse_public_key(&k).unwrap();
+        // A plain key restricted to a network, made a ghostd key.
+        let plain = format!(
+            "from=\"192.0.2.0/24,198.51.100.7\",expiry-time=\"20990101\",pty,command=\"/bin/sh\" {k} me@laptop\n"
+        );
+        let (out, _) = authorize_content(plain.as_bytes(), &a, "x", "/bin/ghostd", true).unwrap();
+        let text = String::from_utf8(out.clone()).unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "command=\"/bin/ghostd stdio --client x\",restrict,from=\"192.0.2.0/24,198.51.100.7\",expiry-time=\"20990101\" {k} ghostd:x\n"
+            )
+        );
+        // Setup again: unchanged, the restriction still there.
+        let (again, outcome) = authorize_content(&out, &a, "x", "/bin/ghostd", false).unwrap();
+        assert_eq!(outcome, Authorized::Unchanged);
+        assert_eq!(again, out);
+        // A restriction added by hand to a ghostd line survives a setup
+        // that moves the binary, and a new key under the same label.
+        let hand = format!(
+            "from=\"10.1.2.3\",command=\"/old/ghostd stdio --client x\",restrict {k} ghostd:x\n"
+        );
+        let (moved, outcome) =
+            authorize_content(hand.as_bytes(), &a, "x", "/bin/ghostd", false).unwrap();
+        assert_eq!(outcome, Authorized::Replaced(1));
+        assert!(
+            String::from_utf8(moved).unwrap().starts_with(
+                "command=\"/bin/ghostd stdio --client x\",restrict,from=\"10.1.2.3\" "
+            )
+        );
+        let b = parse_public_key(&key(5)).unwrap();
+        let (rotated, _) =
+            authorize_content(hand.as_bytes(), &b, "x", "/bin/ghostd", false).unwrap();
+        assert!(
+            String::from_utf8(rotated)
+                .unwrap()
+                .contains(",restrict,from=\"10.1.2.3\" ")
+        );
+        assert_eq!(
+            split_options(r#"a,b="x,\"y\",z",c"#),
+            vec!["a", r#"b="x,\"y\",z""#, "c"]
+        );
     }
 
     #[test]

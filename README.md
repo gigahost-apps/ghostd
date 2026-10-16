@@ -56,7 +56,9 @@ That key then runs only `ghostd`, whatever command the client asks for;
 `restrict` turns off forwarding and terminals. The file is rewritten
 atomically and every other line is kept byte for byte. A key already
 authorized for plain logins is refused unless `--replace` asks to turn it
-into a ghostd-only key (it loses shell access). `ghostd keys list` and
+into a ghostd-only key (it loses shell access). A line that is replaced
+keeps its restrictions (`from=`, `expiry-time=` and the like), so a key
+limited to some addresses stays limited. `ghostd keys list` and
 `ghostd keys remove <label>` only ever touch lines marked `ghostd:<label>`.
 
 ## Connect

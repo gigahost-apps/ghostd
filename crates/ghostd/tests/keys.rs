@@ -142,8 +142,15 @@ fn authorize_list_and_remove() {
     );
     assert!(ok, "{err}");
     let text = String::from_utf8_lossy(&fs::read(&file).unwrap()).into_owned();
-    assert!(!text.contains("from=\"192.0.2.1\""));
-    assert!(text.contains("ghostd:p"));
+    // The plain line gave way, and its source restriction went with the
+    // key onto the ghostd line: replacing never widens where it works from.
+    assert!(!text.lines().any(|l| l.starts_with("from=")), "{text}");
+    assert!(
+        text.lines().any(|l| l.starts_with("command=")
+            && l.contains(",restrict,from=\"192.0.2.1\" ")
+            && l.ends_with("ghostd:p")),
+        "{text}"
+    );
 
     let (ok, v, _) = run(&env, &["keys", "list"]);
     assert!(ok);
