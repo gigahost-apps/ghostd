@@ -9,7 +9,8 @@ It is one binary that needs no service manager:
 `ghostd stdio`, the command an SSH key runs, starts the daemon when none
 runs. Jobs run under their own supervisor process, so they survive the
 connection, the daemon's restarts and its crashes, and stopping one kills
-everything it started. See [the protocol](docs/protocol.md).
+everything it started (a daemon it starts, detached in a session of its
+own, outlives the program's normal end). See [the protocol](docs/protocol.md).
 
 ## Install from source
 

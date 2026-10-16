@@ -33,10 +33,11 @@ pub fn is_same_process(pid: u32, start: u64) -> bool {
 struct Entry {
     ppid: u32,
     pgid: u32,
+    sid: u32,
     zombie: bool,
 }
 
-/// Every process's parent, group and whether it is a zombie.
+/// Every process's parent, group, session and whether it is a zombie.
 fn table() -> HashMap<u32, Entry> {
     let mut map = HashMap::new();
     let Ok(entries) = fs::read_dir("/proc") else {
@@ -53,9 +54,18 @@ fn table() -> HashMap<u32, Entry> {
         if let Some(fields) = stat_fields(pid)
             && let Some(ppid) = fields.get(1).and_then(|p| p.parse::<u32>().ok())
             && let Some(pgid) = fields.get(2).and_then(|p| p.parse::<u32>().ok())
+            && let Some(sid) = fields.get(3).and_then(|p| p.parse::<u32>().ok())
         {
             let zombie = fields.first().is_some_and(|s| s == "Z");
-            map.insert(pid, Entry { ppid, pgid, zombie });
+            map.insert(
+                pid,
+                Entry {
+                    ppid,
+                    pgid,
+                    sid,
+                    zombie,
+                },
+            );
         }
     }
     map
@@ -66,6 +76,8 @@ fn table() -> HashMap<u32, Entry> {
 pub struct Descendant {
     pub pid: u32,
     pub pgid: u32,
+    /// Its session: a process that called `setsid` (a daemon) has its own.
+    pub sid: u32,
 }
 
 /// The processes below `root` (children, their children…), zombies left
@@ -90,6 +102,7 @@ pub fn descendants(root: u32) -> Vec<Descendant> {
                         out.push(Descendant {
                             pid: kid,
                             pgid: entry.pgid,
+                            sid: entry.sid,
                         });
                     }
                     stack.push(kid);

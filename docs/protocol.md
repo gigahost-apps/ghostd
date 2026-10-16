@@ -112,6 +112,17 @@ process below the shim, waits the grace, then SIGKILLs what remains until
 nothing below the shim is left, including processes that left the group or
 started their own session.
 
+When the program ends by itself, what it left in the job's session
+(background processes, `nohup`, double forks) is stopped the same way half
+a second later, while a process that started a session of its own is left
+running: daemons detach that way (`setsid`, `start-stop-daemon
+--background`, `pg_ctl start`, a forking `nginx`, `redis-server
+--daemonize yes`, `tmux new -d`, `screen -dm`), so that `rc-service nginx
+start` or `pg_ctl start` works as an `Exec`. A detached process is then
+init's, not the job's; it should not keep the job's stdout or stderr open
+(daemons redirect them), since nothing reads them once the shim is gone.
+To keep a process that is not a daemon running, start it as a job.
+
 | Request | Answer | Notes |
 |---|---|---|
 | `Ping` | `Pong` | |

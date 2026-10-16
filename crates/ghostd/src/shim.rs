@@ -8,6 +8,13 @@
 //! descendant, waits the grace, then SIGKILLs whatever remains until
 //! nothing below it is left. The worker can die at any time: the shim does
 //! not depend on it.
+//!
+//! When the program ends by itself, the shim stops what it left in the
+//! job's session (background processes, `nohup`, double forks) the same
+//! way, after [`SETTLE`], but leaves the processes that started a session
+//! of their own: daemons (`setsid`, `start-stop-daemon --background`,
+//! `pg_ctl start`, `nginx`, `tmux new -d`) are what a program that exits
+//! leaves running on purpose. The shim then exits and they go to init.
 
 use std::collections::HashSet;
 use std::ffi::OsStr;
@@ -67,6 +74,11 @@ impl Shared {
     }
 }
 
+/// After the program ends by itself, how long what it left behind may take
+/// to detach (a daemon forks, then its child calls `setsid`) before the
+/// rest of the job's session is stopped.
+pub const SETTLE: Duration = Duration::from_millis(500);
+
 fn pid_of(raw: u32) -> Pid {
     Pid::from_raw(i32::try_from(raw).unwrap_or(i32::MAX))
 }
@@ -95,6 +107,8 @@ pub fn run(dir: &Path) -> ExitCode {
         });
     }
     let me = std::process::id();
+    // Ours since the setsid above; the session the job's processes share.
+    let session = nix::unistd::getsid(None).map_or(me, |s| u32::try_from(s.as_raw()).unwrap_or(me));
     let mut status = StatusFile {
         state: State::Running,
         code: None,
@@ -166,15 +180,19 @@ pub fn run(dir: &Path) -> ExitCode {
     let mut supervise = Supervise {
         shared: &shared,
         me,
+        session,
         program,
         program_alive: true,
         exit: None,
         stop: None,
+        leftovers: None,
     };
     let mut exit_seen: Option<Instant> = None;
     let mut final_written = false;
-    loop {
-        let busy = supervise.stop.is_some() || (exit_seen.is_some() && !final_written);
+    let below = loop {
+        let busy = supervise.stop.is_some()
+            || supervise.leftovers.is_some()
+            || (exit_seen.is_some() && !final_written);
         let mut wait = if busy {
             Duration::from_millis(20)
         } else {
@@ -187,6 +205,8 @@ pub fn run(dir: &Path) -> ExitCode {
         }
         match rx.recv_timeout(wait) {
             Ok(Event::Signal(SIGTERM | SIGINT)) => {
+                // A stop takes everything below us, also what a program
+                // that already ended left in its own session.
                 if supervise.stop.is_none() {
                     let grace = requested_grace(dir).unwrap_or(spec.stop_grace_ms);
                     supervise.begin_stop(grace);
@@ -198,10 +218,16 @@ pub fn run(dir: &Path) -> ExitCode {
         }
         supervise.reap();
         if !supervise.program_alive && exit_seen.is_none() {
-            exit_seen = Some(Instant::now());
+            let now = Instant::now();
+            exit_seen = Some(now);
             if supervise.stop.is_none() {
-                // Kill whatever the program left behind.
-                supervise.begin_stop(spec.stop_grace_ms);
+                // It ended by itself: what it left in its session is
+                // stopped after the settle, daemons are left.
+                supervise.leftovers = Some(Leftovers {
+                    settle_until: now + SETTLE,
+                    grace_ms: spec.stop_grace_ms,
+                    stop: None,
+                });
             }
         }
         if let Some(d) = deadline
@@ -212,21 +238,21 @@ pub fn run(dir: &Path) -> ExitCode {
             shared.status().timed_out = true;
             supervise.begin_stop(spec.stop_grace_ms);
         }
-        let remaining = supervise.progress_stop();
+        let progress = supervise.progress();
         // The final state waits for the output to be copied: always when
         // nothing is left that could hold the pipes (they close once the
-        // copiers drain them), at most 100 ms when descendants remain (they
-        // may keep them open), and at most 5 s in any case (a process
-        // outside the tree could hold them).
+        // copiers drain them), at most 100 ms when processes remain below
+        // us (they may keep them open), and at most 5 s in any case (a
+        // process outside the tree could hold them).
         if let Some(seen) = exit_seen
             && !final_written
             && (pipes_open == 0
-                || (remaining > 0 && seen.elapsed() >= Duration::from_millis(100))
+                || (progress.below > 0 && seen.elapsed() >= Duration::from_millis(100))
                 || seen.elapsed() >= Duration::from_secs(5))
         {
             supervise.apply_exit();
-            if remaining == 0 && pipes_open == 0 {
-                // The usual case: nothing left behind, one final write.
+            if progress.waiting == 0 && pipes_open == 0 {
+                // The usual case: nothing left to stop, one final write.
                 shared.status().tree_gone = true;
                 shared.write(true);
                 return ExitCode::SUCCESS;
@@ -234,16 +260,22 @@ pub fn run(dir: &Path) -> ExitCode {
             shared.write(true);
             final_written = true;
         }
-        if final_written && remaining == 0 {
-            break;
+        if final_written && progress.waiting == 0 {
+            break progress.below;
         }
         if shared.dirty.load(Ordering::Relaxed) {
             shared.write(false);
         }
-    }
-    // Everything below us is gone, so the pipes close; give the copiers a
-    // moment to drain what is left.
-    let until = Instant::now() + Duration::from_secs(2);
+    };
+    // What we waited for is gone, so the pipes close unless a detached
+    // process still holds them; give the copiers a moment to drain what is
+    // left.
+    let drain = if below == 0 {
+        Duration::from_secs(2)
+    } else {
+        Duration::from_millis(100)
+    };
+    let until = Instant::now() + drain;
     while pipes_open > 0 {
         match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
             Ok(Event::PipeClosed) => pipes_open -= 1,
@@ -294,15 +326,38 @@ struct StopState {
     termed: HashSet<u32>,
 }
 
+/// What a program that ended by itself left in the job's session.
+struct Leftovers {
+    settle_until: Instant,
+    grace_ms: u64,
+    /// Set once the settle is over and something is left to stop.
+    stop: Option<StopState>,
+}
+
+/// Where a stop stands.
+struct Progress {
+    /// Every process below us, the program included.
+    below: usize,
+    /// The processes we still wait for: everything during a stop, the
+    /// program while it runs, what it left in its session after it ended.
+    waiting: usize,
+}
+
 struct Supervise<'a> {
     shared: &'a Shared,
     me: u32,
+    /// The job's session (ours): a process below us in another one
+    /// detached itself.
+    session: u32,
     program: u32,
     /// Until we reap the program its pid (and so its group id) cannot be
     /// reused, so signalling the group is safe exactly while this is true.
     program_alive: bool,
     exit: Option<(State, Option<i32>, Option<i32>, u64)>,
+    /// A stop of the whole tree (a `JobStop`, a timeout).
     stop: Option<StopState>,
+    /// The program ended by itself (and no stop came first).
+    leftovers: Option<Leftovers>,
 }
 
 impl Supervise<'_> {
@@ -365,25 +420,63 @@ impl Supervise<'_> {
     }
 
     /// Signals what appeared since and, past the grace, SIGKILLs all that
-    /// is left. Answers how many processes remain below us.
-    fn progress_stop(&mut self) -> usize {
-        let Some(stop) = &mut self.stop else {
-            return usize::from(self.program_alive);
+    /// is left: everything below us during a stop, what the program left
+    /// in the job's session after it ended by itself.
+    fn progress(&mut self) -> Progress {
+        let program = usize::from(self.program_alive);
+        if let Some(stop) = &mut self.stop {
+            let descendants = procfs::descendants(self.me);
+            let killing = Instant::now() >= stop.kill_at;
+            if killing && self.program_alive {
+                let _ = killpg(pid_of(self.program), Signal::SIGKILL);
+            }
+            signal_all(stop, &descendants, killing);
+            let below = descendants.len() + program;
+            return Progress {
+                below,
+                waiting: below,
+            };
+        }
+        let Some(leftovers) = &mut self.leftovers else {
+            return Progress {
+                below: program,
+                waiting: program,
+            };
         };
         let descendants = procfs::descendants(self.me);
-        let killing = Instant::now() >= stop.kill_at;
-        if killing && self.program_alive {
-            let _ = killpg(pid_of(self.program), Signal::SIGKILL);
+        // A process that started a session of its own left on purpose.
+        let in_session: Vec<procfs::Descendant> = descendants
+            .iter()
+            .copied()
+            .filter(|d| d.sid == self.session)
+            .collect();
+        let now = Instant::now();
+        if !in_session.is_empty() && now >= leftovers.settle_until {
+            let grace = Duration::from_millis(leftovers.grace_ms);
+            let stop = leftovers.stop.get_or_insert_with(|| StopState {
+                kill_at: now + grace,
+                termed: HashSet::new(),
+            });
+            let killing = now >= stop.kill_at;
+            signal_all(stop, &in_session, killing);
         }
-        for d in &descendants {
-            if killing {
-                let _ = kill(pid_of(d.pid), Signal::SIGKILL);
-            } else if stop.termed.insert(d.pid) {
-                let _ = kill(pid_of(d.pid), Signal::SIGTERM);
-                let _ = kill(pid_of(d.pid), Signal::SIGCONT);
-            }
+        Progress {
+            below: descendants.len(),
+            waiting: in_session.len(),
         }
-        descendants.len() + usize::from(self.program_alive)
+    }
+}
+
+/// SIGKILLs `targets` when `killing`, else SIGTERMs (and SIGCONTs) each
+/// one not signalled before.
+fn signal_all(stop: &mut StopState, targets: &[procfs::Descendant], killing: bool) {
+    for d in targets {
+        if killing {
+            let _ = kill(pid_of(d.pid), Signal::SIGKILL);
+        } else if stop.termed.insert(d.pid) {
+            let _ = kill(pid_of(d.pid), Signal::SIGTERM);
+            let _ = kill(pid_of(d.pid), Signal::SIGCONT);
+        }
     }
 }
 

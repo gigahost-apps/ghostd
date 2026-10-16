@@ -277,3 +277,30 @@ async fn an_exec_job_is_listed() {
             .any(|j| j.job_id == r.job_id && j.name.as_deref() == Some("named"))
     );
 }
+
+#[tokio::test]
+async fn a_daemon_outlives_a_normal_exit_and_the_rest_is_stopped() {
+    let env = Env::new();
+    let c = env.connect().await;
+    // `setsid` detaches the first sleep into a session of its own, as a
+    // daemon (start-stop-daemon --background, pg_ctl, nginx) does; the
+    // second stays in the job's session. The shell exits at once, before
+    // the first may even have called setsid.
+    let r = exec(
+        &c,
+        sh("setsid sleep 77 >/dev/null 2>&1 </dev/null & echo $!; sleep 78 >/dev/null 2>&1 & echo $!; echo started"),
+    )
+    .await;
+    assert_eq!(r.outcome, Outcome::Exited { code: 0 }, "{r:?}");
+    let text = String::from_utf8(r.stdout.data).unwrap();
+    let pids: Vec<u32> = text.lines().filter_map(|l| l.parse().ok()).collect();
+    assert_eq!(pids.len(), 2, "{text}");
+    let (daemon, leftover) = (pids[0], pids[1]);
+    // The shim stops what was left in the session, then exits.
+    wait_gone(leftover);
+    env.wait_for("the shim to exit", || env.processes("shim").is_empty());
+    assert!(common::alive(daemon), "the detached daemon was killed");
+    let info = wait_job(&c, &r.job_id).await;
+    assert_eq!(info.state, JobState::Exited { code: 0 });
+    common::signal(daemon, 9);
+}
