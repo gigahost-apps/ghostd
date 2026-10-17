@@ -6,7 +6,7 @@ mod common;
 use std::os::unix::fs::PermissionsExt;
 
 use common::{Env, sh};
-use ghostd_client::{ClientError, Connection};
+use ghostd_client::{ClientError, Connection, Options};
 use ghostd_protocol::v1::{self, Outcome};
 use ghostd_protocol::v2::{ErrorKind, HostId, Identity, Request, Response};
 
@@ -112,4 +112,69 @@ async fn a_request_for_another_host_runs_nothing() {
         matches!(&e, ClientError::Remote(r) if r.kind == ErrorKind::HostMismatch),
         "{e}"
     );
+}
+
+#[tokio::test]
+async fn an_unreadable_host_id_refuses_only_what_expects_one() {
+    let env = Env::new();
+    std::fs::create_dir_all(&env.state).unwrap();
+    let file = env.state.join("host-id");
+    std::fs::write(&file, "junk\n").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let marker = env.home.join("ran");
+    let touch = || v1::Request::Exec(sh("touch ran"));
+
+    // The daemon serves: Identify says what is wrong.
+    let c = env.connect_v2().await;
+    let e = c.call(Request::Identify).await.unwrap_err();
+    let ClientError::Remote(remote) = &e else {
+        panic!("not a remote error: {e}");
+    };
+    assert_eq!(remote.kind, ErrorKind::Io, "{remote}");
+    assert!(remote.message.contains("host-id"), "{remote}");
+    assert!(remote.message.contains("remove it"), "{remote}");
+
+    // A request that expects a host is refused and runs nothing.
+    c.set_expected_host(Some(HostId([7; 16])));
+    let e = c.call(touch()).await.unwrap_err();
+    let ClientError::Remote(remote) = &e else {
+        panic!("not a remote error: {e}");
+    };
+    assert_eq!(remote.kind, ErrorKind::HostMismatch, "{remote}");
+    assert!(remote.message.contains("cannot read"), "{remote}");
+    assert!(remote.message.contains(&"07".repeat(16)), "{remote}");
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!marker.exists(), "an unchecked request ran");
+
+    // One that expects none runs, and so does a version 1 client's.
+    c.set_expected_host(None);
+    c.call(touch()).await.unwrap();
+    assert!(marker.exists());
+    let old = env
+        .try_connect(Options {
+            max: 1,
+            ..Options::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(old.version(), 1);
+    assert_eq!(
+        old.call(v1::Request::Ping).await.unwrap(),
+        v1::Response::Pong
+    );
+    // The file is never replaced.
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), "junk\n");
+
+    // Removed (through the daemon itself), the next request that needs an
+    // ID makes one, without a restart.
+    let rm = sh(&format!("rm '{}'", file.display()));
+    let v1::Response::Exec(r) = c.call(v1::Request::Exec(rm)).await.unwrap() else {
+        panic!("no exec result");
+    };
+    assert_eq!(r.outcome, Outcome::Exited { code: 0 });
+    assert!(!file.exists());
+    let id = identify(&c).await.host_id;
+    assert_eq!(std::fs::read_to_string(&file).unwrap(), format!("{id}\n"));
+    c.set_expected_host(Some(id));
+    c.call(v1::Request::Ping).await.unwrap();
 }

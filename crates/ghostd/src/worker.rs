@@ -52,9 +52,33 @@ struct Shared {
     jobs: Arc<Jobs>,
     sessions: Arc<Sessions>,
     uid: u32,
-    host_id: HostId,
+    /// Empty while `<state>/host-id` cannot be read: every request that
+    /// expects a host ID is then refused.
+    host_id: Arc<hostid::Slot>,
     /// Where `MachineState` looks its commands up.
     path_env: Option<std::ffi::OsString>,
+}
+
+impl Shared {
+    /// This daemon's host ID, read again when it could not be read before
+    /// (a file repaired or removed meanwhile).
+    async fn host_id(&self) -> Result<HostId, String> {
+        if let Some(id) = self.host_id.known() {
+            return Ok(id);
+        }
+        let slot = Arc::clone(&self.host_id);
+        let paths = self.paths.clone();
+        tokio::task::spawn_blocking(move || {
+            let id = slot.load()?;
+            log(
+                &paths,
+                &format!("worker: host ID {id}, read after it failed"),
+            );
+            Ok(id)
+        })
+        .await
+        .map_err(|e| format!("a task failed: {e}"))?
+    }
 }
 
 pub fn run(paths: &Paths) -> ExitCode {
@@ -76,13 +100,18 @@ pub fn run(paths: &Paths) -> ExitCode {
         log(paths, &format!("worker: directories: {e}"));
         return ExitCode::from(1);
     }
-    let host_id = match hostid::load_or_create(&paths.host_id()) {
-        Ok(id) => id,
-        Err(e) => {
-            log(paths, &format!("worker: host ID: {e}"));
-            return ExitCode::from(1);
-        }
-    };
+    // A host ID that cannot be read stops nothing but the requests that
+    // expect one: the machine stays reachable to repair it.
+    let host_id = Arc::new(hostid::Slot::new(paths.host_id()));
+    if let Err(why) = host_id.load() {
+        log(
+            paths,
+            &format!(
+                "worker: host ID: {why}; serving without one: Identify and every request that \
+                 expects a host ID are refused until it can be read"
+            ),
+        );
+    }
     // One worker serves the socket: a second waits for the first to go.
     let lock_file = match OpenOptions::new()
         .create(true)
@@ -172,10 +201,9 @@ async fn serve(shared: Arc<Shared>) -> ExitCode {
         &shared.paths,
         &format!("worker: serving {}", socket.display()),
     );
-    log(
-        &shared.paths,
-        &format!("worker: host ID {}", shared.host_id),
-    );
+    if let Some(id) = shared.host_id.known() {
+        log(&shared.paths, &format!("worker: host ID {id}"));
+    }
     {
         let jobs = Arc::clone(&shared.jobs);
         let sessions = Arc::clone(&shared.sessions);
@@ -536,21 +564,13 @@ async fn connection(stream: UnixStream, shared: Arc<Shared>) {
             }
         };
         // Before anything else: a request meant for another machine runs
-        // nothing here.
+        // nothing here, nor one that cannot be checked.
         if let Some(expected) = expected_host
-            && expected != shared.host_id
+            && let Some(message) = host_mismatch(shared.host_id().await, expected)
         {
             let mismatch = Answer::V2(v2::ServerFrame::Response {
                 id,
-                result: Err(v2::Error::new(
-                    v2::ErrorKind::HostMismatch,
-                    format!(
-                        "this ghostd's host ID is {}, the request expected {expected}: the name \
-                         or address now reaches another machine, or this machine's ghostd state \
-                         is new; nothing was run",
-                        shared.host_id
-                    ),
-                )),
+                result: Err(v2::Error::new(v2::ErrorKind::HostMismatch, message)),
             });
             let _ = tx.send(Outgoing::Frame(mismatch)).await;
             continue;
@@ -591,6 +611,23 @@ async fn connection(stream: UnixStream, shared: Arc<Shared>) {
     drop(uploads);
 }
 
+/// Why a request that expects `expected` is refused, `None` when this is
+/// the host it expects.
+fn host_mismatch(ours: Result<HostId, String>, expected: HostId) -> Option<String> {
+    match ours {
+        Ok(ours) if ours == expected => None,
+        Ok(ours) => Some(format!(
+            "this ghostd's host ID is {ours}, the request expected {expected}: the name or \
+             address now reaches another machine, or this machine's ghostd state is new; nothing \
+             was run"
+        )),
+        Err(why) => Some(format!(
+            "this ghostd cannot read its host ID, so it cannot tell whether it is the host the \
+             request expected ({expected}); nothing was run: {why}"
+        )),
+    }
+}
+
 async fn blocking_v2<T, F>(f: F) -> Result<T, v2::Error>
 where
     F: FnOnce() -> Result<T, v2::Error> + Send + 'static,
@@ -616,7 +653,12 @@ async fn handle_v2(
             .map(A::V1)
             .map_err(v2::Error::from),
         R::Identify => {
-            let host_id = shared.host_id;
+            let host_id = shared.host_id().await.map_err(|why| {
+                v2::Error::new(
+                    v2::ErrorKind::Io,
+                    format!("this ghostd has no host ID: {why}"),
+                )
+            })?;
             blocking_v2(move || Ok(A::Identity(machine::identity(host_id)))).await
         }
         R::SessionStart(spec) => sessions
@@ -816,6 +858,20 @@ async fn handle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_host_check() {
+        let ours = HostId([1; 16]);
+        assert_eq!(host_mismatch(Ok(ours), ours), None);
+        let other = host_mismatch(Ok(ours), HostId([2; 16])).unwrap();
+        assert!(other.contains(&ours.to_string()), "{other}");
+        assert!(other.contains(&HostId([2; 16]).to_string()), "{other}");
+        // An ID that cannot be read matches none.
+        let unread = host_mismatch(Err("host-id: broken".into()), ours).unwrap();
+        assert!(unread.contains("cannot read"), "{unread}");
+        assert!(unread.contains("host-id: broken"), "{unread}");
+        assert!(unread.contains(&ours.to_string()), "{unread}");
+    }
 
     #[test]
     fn only_the_own_uid() {

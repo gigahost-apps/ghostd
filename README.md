@@ -114,12 +114,26 @@ note, never a failure.
 
 The daemon makes a random host ID the first time it starts and keeps it in
 `<state>/host-id`. It stays across restarts, updates and reboots, and
-changes only with the machine or its ghostd state (a reinstall, a swapped
-disk, another machine behind the same name or address, another user's
-daemon). A client that kept it sends it with its requests: a daemon with
-another ID answers `HostMismatch` and runs nothing, so a request never
-lands on the wrong machine. Remove the file only to make the machine a new
-one: every client that knew the old ID refuses it until it forgets it.
+changes with the ghostd state: a reinstall, a swapped disk, another
+machine behind the same name or address, another user's daemon. A client
+that kept it sends it with its requests: a daemon with another ID answers
+`HostMismatch` and runs nothing, so a request that reaches a different
+ghostd state than the one the client knew is refused. Only requests that
+carry an ID, on a protocol version 2 connection, are checked.
+
+A copy of the state keeps the ID: a disk image of the machine, or a new
+machine made from its backup, answers to the old machine's ID, and a
+client whose name or address now reaches the copy (a reused address)
+cannot tell the two apart. Remove `<state>/host-id` on the copy before its
+ghostd first starts (a tool that makes machines from images or backups
+should), or remove it and run `ghostd stop`: the next start makes a new
+ID. Remove the file only to make the machine a new one: every client that
+knew the old ID refuses it until it forgets it.
+
+A file that holds no host ID is never replaced. The daemon still serves,
+but `Identify` fails and every request that expects an ID is refused
+(`HostMismatch`) until the file is repaired or removed; `ghostd.log` says
+so.
 
 ## Commands
 

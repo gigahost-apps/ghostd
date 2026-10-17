@@ -224,20 +224,32 @@ A `HostId` is 16 random bytes (shown as 32 hex digits) that the worker
 makes the first time it starts with none and keeps in `<state>/host-id`
 (0600, written atomically). It is never made again while the file exists,
 so it stays across daemon restarts, updates and reboots, and it changes
-when the machine or its ghostd state is new: a reinstall, a swapped disk,
-another machine behind the same name or address, another user's daemon. A
-file that holds no host ID stops the worker (it says so in `ghostd.log`)
-instead of being replaced.
+when the ghostd state is new: a reinstall, a swapped disk, another machine
+behind the same name or address, another user's daemon. It identifies the
+state, not the hardware: a copy of the state (a disk image of the
+machine, a new machine made from its backup) keeps the ID and passes the
+check, so whatever makes such a copy should remove `<state>/host-id` on it
+before its ghostd first starts (or remove it and run `ghostd stop`; the
+next start makes a new ID).
+
+A file that holds no host ID, or cannot be read, is never replaced: the
+worker serves without an ID (it says so in `ghostd.log` at each start),
+answers `Identify` with an `Io` error naming the file, and refuses every
+request that carries an `expected_host` with `HostMismatch`. It reads the
+file again whenever an ID is needed, so a repaired or removed file (a new
+ID is then made) takes effect without a restart. Requests without an
+`expected_host`, and version 1 connections, are served as usual.
 
 Every request may carry the `expected_host` a client learned before. When
-it is `Some` and not this daemon's ID, the request is answered
-`HostMismatch` (naming both IDs) before anything else is done: nothing
-runs, nothing is created, also for a version 1 request in a `V1`. `None`
-skips the check.
+it is `Some` and not this daemon's ID (or the daemon has none it can
+read), the request is answered `HostMismatch` (naming both IDs, or why the
+ID cannot be read) before anything else is done: nothing runs, nothing is
+created, also for a version 1 request in a `V1`. `None` skips the check,
+and a version 1 connection has none.
 
 | Request | Answer | Notes |
 |---|---|---|
-| `Identify` | `Identity { host_id, hostname, machine_id, boot_id, program_version, uid }` | `machine_id` from `/etc/machine-id`, `boot_id` from `/proc/sys/kernel/random/boot_id` (new on every boot), when readable. |
+| `Identify` | `Identity { host_id, hostname, machine_id, boot_id, program_version, uid }` | `machine_id` from `/etc/machine-id`, `boot_id` from `/proc/sys/kernel/random/boot_id` (new on every boot), when readable. An `Io` error while the host ID cannot be read. |
 
 ### Sessions
 

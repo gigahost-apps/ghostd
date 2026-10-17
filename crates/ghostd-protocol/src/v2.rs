@@ -8,10 +8,11 @@
 //! never copied). The new requests follow it.
 //!
 //! Each request may carry the [`HostId`] the client expects: a server with
-//! another ID answers [`ErrorKind::HostMismatch`] without running anything,
-//! so a client that kept a machine's ID finds out when the name or address
-//! it connects to now reaches another machine (or the same machine with a
-//! new ghostd state).
+//! another ID (or none it can read) answers [`ErrorKind::HostMismatch`]
+//! without running anything, so a client that kept a machine's ID finds out
+//! when the name or address it connects to now reaches another ghostd state
+//! (another machine, or this one with a new state). A copy of the state (a
+//! disk image, a backup restored elsewhere) keeps the ID and passes.
 //!
 //! Do not change anything in this module once released: a change is
 //! protocol version 3, in a new module (see the crate's versioning rule).
@@ -32,9 +33,10 @@ pub const VERSION: u32 = 2;
 
 /// A daemon's identity: 16 random bytes it made the first time it started
 /// with no state, kept in its state directory. It stays across restarts,
-/// updates and reboots, and changes when the machine or its ghostd state is
-/// new (reinstalled, swapped, another user's daemon). Shown as 32 lowercase
-/// hex digits.
+/// updates and reboots, and changes when its ghostd state is new
+/// (reinstalled, swapped, another user's daemon); a copy of the state (a
+/// disk image, a restored backup) keeps it. Shown as 32 lowercase hex
+/// digits.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct HostId(pub [u8; 16]);
 
@@ -132,8 +134,8 @@ pub enum ErrorKind {
     Io,
     Unsupported,
     Internal,
-    /// The request's `expected_host` is not this server's [`HostId`]:
-    /// nothing was run.
+    /// The request's `expected_host` is not this server's [`HostId`], or
+    /// the server cannot read its own: nothing was run.
     HostMismatch,
 }
 
@@ -170,7 +172,8 @@ pub enum Request {
     /// A version 1 request, with version 1's meaning; answered
     /// [`Response::V1`].
     V1(v1::Request),
-    /// Answered [`Response::Identity`].
+    /// Answered [`Response::Identity`]; an [`ErrorKind::Io`] error while
+    /// the server cannot read its host ID.
     Identify,
     /// Starts a program on a new PTY and answers its ID at once.
     SessionStart(SessionSpec),
