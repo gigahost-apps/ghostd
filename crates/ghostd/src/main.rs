@@ -2,18 +2,25 @@
 
 mod config;
 mod files;
+mod hostid;
 mod jobfiles;
 mod jobs;
+mod keys;
 mod logfile;
+mod machine;
 mod paths;
 mod procfs;
 mod relay;
+mod sessions;
+mod sessproto;
 mod setup;
 mod shim;
 mod supervisor;
 mod util;
+mod waits;
 mod worker;
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -48,9 +55,21 @@ enum Command {
     /// Serve the socket (started by the daemon).
     #[command(hide = true)]
     Worker,
-    /// Run one job's program (started by the worker).
+    /// Run one job's program, or hold one session's terminal (started by
+    /// the worker).
     #[command(hide = true)]
-    Shim { job_dir: PathBuf },
+    Shim {
+        job_dir: PathBuf,
+        #[arg(long)]
+        session: bool,
+    },
+    /// Start a session's program on its terminal (started by its shim).
+    #[command(hide = true)]
+    PtyExec {
+        tty: PathBuf,
+        #[arg(last = true, required = true)]
+        argv: Vec<OsString>,
+    },
     /// Create the directories and the configuration file; record the
     /// install origin. Nothing under `~/.ssh` is ever touched.
     Setup {
@@ -77,7 +96,15 @@ fn main() -> ExitCode {
         Command::Stdio { client } => relay::run(&paths, client),
         Command::Daemon => supervisor::daemon(&paths),
         Command::Worker => worker::run(&paths),
-        Command::Shim { job_dir } => shim::run(&job_dir),
+        Command::Shim {
+            job_dir,
+            session: false,
+        } => shim::run(&job_dir),
+        Command::Shim {
+            job_dir,
+            session: true,
+        } => shim::run_session(&job_dir),
+        Command::PtyExec { tty, argv } => shim::pty_exec(&tty, &argv),
         Command::Setup {
             origin,
             git_ref,

@@ -10,6 +10,7 @@ use std::time::Duration;
 use common::{Env, Raw, exec, sh};
 use ghostd_client::{ClientError, Connection, Options};
 use ghostd_protocol::v1::{ClientFrame, Outcome, Request, Response, ServerFrame};
+use ghostd_protocol::v2;
 use ghostd_protocol::{MAX_FRAME, decode, encode_frame};
 
 #[tokio::test]
@@ -17,16 +18,17 @@ async fn negotiation_against_the_daemon() {
     let env = Env::new();
     let refused = env
         .try_connect(Options {
-            min: 2,
-            max: 3,
+            min: 3,
+            max: 4,
             program_version: "future".into(),
         })
         .await
         .unwrap_err();
     let text = refused.to_string();
     assert!(matches!(refused, ClientError::Refused { .. }), "{text}");
-    assert!(text.contains("1..=1") && text.contains("2..=3"), "{text}");
+    assert!(text.contains("1..=2") && text.contains("3..=4"), "{text}");
     assert!(text.contains("update ghostd"), "{text}");
+    // A newer client: the highest both speak.
     let c = env
         .try_connect(Options {
             min: 1,
@@ -35,9 +37,41 @@ async fn negotiation_against_the_daemon() {
         })
         .await
         .unwrap();
-    assert_eq!(c.version(), 1);
+    assert_eq!(c.version(), 2);
+    assert!(c.host_check());
     assert_eq!(c.server_version(), env!("CARGO_PKG_VERSION"));
     assert_eq!(c.call(Request::Ping).await.unwrap(), Response::Pong);
+    // A client of version 2 only.
+    let c = env
+        .try_connect(Options {
+            min: 2,
+            max: 2,
+            program_version: "two".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(c.version(), 2);
+    assert_eq!(c.call(Request::Ping).await.unwrap(), Response::Pong);
+    // An older client (0.1.x): version 1, as before.
+    let c = env
+        .try_connect(Options {
+            min: 1,
+            max: 1,
+            program_version: "0.1.1".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(c.version(), 1);
+    assert!(!c.host_check());
+    assert_eq!(c.call(Request::Ping).await.unwrap(), Response::Pong);
+    // A version 2 request is refused before anything is sent.
+    let e = c.call(v2::Request::Identify).await.unwrap_err();
+    assert!(matches!(e, ClientError::Unsupported(_)), "{e}");
+    // A version 1 request in version 2's clothes goes as version 1.
+    assert_eq!(
+        c.call(v2::Request::V1(Request::Ping)).await.unwrap(),
+        v2::Response::V1(Response::Pong)
+    );
 }
 
 #[tokio::test]

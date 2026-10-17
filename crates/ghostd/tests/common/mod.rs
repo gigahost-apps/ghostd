@@ -24,6 +24,8 @@ pub const TEST_CONFIG: &str = "stop_grace_ms = 300\n";
 
 pub struct Env {
     pub dir: tempfile::TempDir,
+    /// `PATH` for the relay (and so the daemon it starts), when set.
+    pub path: Option<PathBuf>,
     pub home: PathBuf,
     pub state: PathBuf,
     pub runtime: PathBuf,
@@ -45,6 +47,7 @@ impl Env {
         let config_path = dir.path().join("config.toml");
         fs::write(&config_path, config).unwrap();
         Self {
+            path: None,
             home,
             state: dir.path().join("state"),
             runtime: dir.path().join("run"),
@@ -85,11 +88,32 @@ impl Env {
         }
         c.env("GHOSTD", EXE);
         c.env_remove("XDG_RUNTIME_DIR");
+        if let Some(path) = &self.path {
+            c.env("PATH", path);
+        }
         c
     }
 
+    /// A connection with the client's default range, or up to
+    /// `GHOSTD_TEST_PROTOCOL_MAX` when set (`=1` runs the suite as a
+    /// version 1 client does).
     pub async fn connect(&self) -> Connection {
-        self.try_connect(Options::default()).await.unwrap()
+        let mut options = Options::default();
+        if let Some(max) = std::env::var("GHOSTD_TEST_PROTOCOL_MAX")
+            .ok()
+            .and_then(|m| m.parse().ok())
+        {
+            options.max = max;
+        }
+        self.try_connect(options).await.unwrap()
+    }
+
+    /// A connection at protocol version 2 (for the version 2 tests,
+    /// whatever `GHOSTD_TEST_PROTOCOL_MAX` says).
+    pub async fn connect_v2(&self) -> Connection {
+        let c = self.try_connect(Options::default()).await.unwrap();
+        assert_eq!(c.version(), 2);
+        c
     }
 
     pub async fn try_connect(
@@ -109,6 +133,17 @@ impl Env {
                     .ok()
                     .and_then(|c| c.split(|&b| b == 0).nth(1).map(<[u8]>::to_vec))
                     .is_some_and(|arg| arg == role.as_bytes())
+            })
+            .collect()
+    }
+
+    /// Our processes (found by their environment) whose command name is
+    /// `comm`.
+    pub fn named(&self, comm: &str) -> Vec<u32> {
+        ours(&self.state)
+            .into_iter()
+            .filter(|pid| {
+                fs::read_to_string(format!("/proc/{pid}/comm")).is_ok_and(|c| c.trim() == comm)
             })
             .collect()
     }

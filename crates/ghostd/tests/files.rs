@@ -10,7 +10,8 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 
 use common::Env;
 use ghostd_client::{ClientError, Connection};
-use ghostd_protocol::v1::{ErrorKind, FileKind, Request, Response};
+use ghostd_protocol::v1::{FileKind, Request, Response};
+use ghostd_protocol::v2::ErrorKind;
 use sha2::{Digest, Sha256};
 
 async fn call(c: &Connection, r: Request) -> Response {

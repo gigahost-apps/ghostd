@@ -9,7 +9,8 @@ use std::time::{Duration, Instant, SystemTime};
 
 use common::{Env, alive, exec, sh, signal, start, status, wait_gone, wait_job};
 use ghostd_client::Connection;
-use ghostd_protocol::v1::{ErrorKind, JobInfo, JobState, LogSlice, Request, Response, Stream};
+use ghostd_protocol::v1::{JobInfo, JobState, LogSlice, Request, Response, Stream};
+use ghostd_protocol::v2::ErrorKind;
 
 async fn log(
     c: &Connection,

@@ -5,7 +5,7 @@
 //! [`ServerHello`] frame; the client answers with a [`ClientHello`]; the
 //! server answers that with a [`HelloAnswer`]. After a
 //! [`HelloAnswer::Welcome`] both sides speak the agreed protocol version's
-//! messages, for version 1 those of [`v1`].
+//! messages: those of [`v1`] or of [`v2`].
 //!
 //! # Versioning rule
 //!
@@ -25,6 +25,7 @@
 mod frame;
 mod hello;
 pub mod v1;
+pub mod v2;
 
 pub use frame::{FrameDecoder, FrameError, MAX_FRAME, MAX_HELLO_FRAME, decode, encode_frame};
 pub use hello::{

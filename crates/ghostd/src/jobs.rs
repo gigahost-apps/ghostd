@@ -30,14 +30,14 @@ use crate::util::{B64, atomic_write, err, io_error, now_ms, random_hex, resolve}
 /// How long a `JobWait` may wait.
 const MAX_WAIT_MS: u64 = 60_000;
 /// A job directory without a status this old is a shim that never started.
-const STARTING_GRACE_MS: u64 = 30_000;
+pub const STARTING_GRACE_MS: u64 = 30_000;
 /// A job directory with neither a spec nor a status this old is one the
 /// worker died creating (no shim ever started for it).
 const ABANDONED_AFTER: Duration = Duration::from_hours(1);
 /// What an exec's two outputs may take of a frame, leaving room for the rest.
 const EXEC_OUTPUT_BUDGET: usize = ghostd_protocol::MAX_FRAME - 64 * 1024;
 /// How often job state is polled.
-const POLL: Duration = Duration::from_millis(50);
+pub const POLL: Duration = Duration::from_millis(50);
 
 pub struct Jobs {
     root: PathBuf,
@@ -45,12 +45,12 @@ pub struct Jobs {
     start_lock: tokio::sync::Mutex<()>,
 }
 
-/// A job's state as read from its directory.
-struct Live {
-    spec: SpecFile,
-    status: Option<StatusFile>,
+/// A job's (or a session's) state as read from its directory.
+pub struct Live {
+    pub spec: SpecFile,
+    pub status: Option<StatusFile>,
     /// The shim (and so the program or what it left) still runs.
-    busy: bool,
+    pub busy: bool,
 }
 
 fn valid_id(id: &str) -> bool {
@@ -90,12 +90,12 @@ where
         .map_err(|e| blocking_error(&e))?
 }
 
-fn pid(raw: u32) -> Pid {
+pub fn pid(raw: u32) -> Pid {
     Pid::from_raw(i32::try_from(raw).unwrap_or(i32::MAX))
 }
 
 /// The first four arguments, lossy, at most 200 characters.
-fn summarize(argv: &[Vec<u8>]) -> String {
+pub fn summarize(argv: &[Vec<u8>]) -> String {
     let joined = argv
         .iter()
         .take(4)
@@ -105,7 +105,7 @@ fn summarize(argv: &[Vec<u8>]) -> String {
     joined.chars().take(200).collect()
 }
 
-fn check_bytes(what: &str, bytes: &[u8]) -> Result<(), Error> {
+pub fn check_bytes(what: &str, bytes: &[u8]) -> Result<(), Error> {
     if bytes.contains(&0) {
         return Err(err(
             ErrorKind::InvalidArgument,
@@ -140,7 +140,7 @@ impl Jobs {
     /// Reads a job's files. A status that exists but cannot be read is an
     /// error, never "no status": a job is only ever taken for finished on
     /// what its own status says.
-    fn live(dir: &Path) -> io::Result<Live> {
+    pub fn live(dir: &Path) -> io::Result<Live> {
         let spec = read_spec(dir)?;
         let mut status = read_status_checked(dir)?;
         let busy = match &status {
@@ -164,7 +164,7 @@ impl Jobs {
         Ok(Live { spec, status, busy })
     }
 
-    fn state(live: &Live) -> JobState {
+    pub fn state(live: &Live) -> JobState {
         match &live.status {
             None if live.busy => JobState::Running,
             None => JobState::Lost,
@@ -205,6 +205,15 @@ impl Jobs {
             },
             finished: !live.busy,
         }
+    }
+
+    /// A job's directory, for a wait on its log.
+    ///
+    /// # Errors
+    ///
+    /// `NotFound` for an unknown job.
+    pub fn log_dir(&self, id: &str) -> Result<PathBuf, Error> {
+        self.dir(id)
     }
 
     /// A job's info.
@@ -381,6 +390,8 @@ impl Jobs {
             summary,
             created_at_ms: now_ms(),
             spec_sha256: digest,
+            cols: None,
+            rows: None,
         })
     }
 
@@ -933,7 +944,7 @@ pub struct Collected {
 
 /// A directory the worker died creating: neither a spec nor a status (so
 /// no shim ever ran for it), untouched for an hour.
-fn abandoned(dir: &Path) -> bool {
+pub fn abandoned(dir: &Path) -> bool {
     !dir.join(SPEC).exists()
         && !dir.join(STATUS).exists()
         && fs::metadata(dir)
@@ -960,8 +971,8 @@ enum Created {
     Exists(Started),
 }
 
-/// The SHA-256 of a request's `ExecSpec` as encoded on the wire, in hex.
-fn spec_digest(spec: &ExecSpec) -> String {
+/// The SHA-256 of a request's spec as encoded on the wire, in hex.
+pub fn spec_digest<T: serde::Serialize>(spec: &T) -> String {
     use std::fmt::Write as _;
     let bytes = ghostd_protocol::encode_frame(spec).unwrap_or_default();
     Sha256::digest(&bytes)

@@ -8,7 +8,8 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use ghostd_protocol::v1::{self, ClientFrame, Error, ErrorKind, Request, Response, ServerFrame};
+use ghostd_protocol::v1::{self, Error, ErrorKind, Request, Response};
+use ghostd_protocol::v2::{self, HostId};
 use ghostd_protocol::{
     ClientHello, FrameDecoder, HelloAnswer, MARKER, MAX_FRAME, MAX_HELLO_FRAME, PROTOCOL_MAX,
     PROTOCOL_MIN, RelayInfo, ServerHello, decode, encode_frame, negotiate, outdated_side,
@@ -24,7 +25,9 @@ use crate::files::{self, SearchSpec, Uploads};
 use crate::jobs::Jobs;
 use crate::logfile::log;
 use crate::paths::Paths;
+use crate::sessions::Sessions;
 use crate::util::err;
+use crate::{hostid, machine, waits};
 
 /// Requests in flight on one connection; more are answered `Busy`.
 pub const MAX_IN_FLIGHT: usize = 64;
@@ -47,7 +50,11 @@ pub fn peer_allowed(peer_uid: u32, own_uid: u32) -> bool {
 struct Shared {
     paths: Paths,
     jobs: Arc<Jobs>,
+    sessions: Arc<Sessions>,
     uid: u32,
+    host_id: HostId,
+    /// Where `MachineState` looks its commands up.
+    path_env: Option<std::ffi::OsString>,
 }
 
 pub fn run(paths: &Paths) -> ExitCode {
@@ -69,6 +76,13 @@ pub fn run(paths: &Paths) -> ExitCode {
         log(paths, &format!("worker: directories: {e}"));
         return ExitCode::from(1);
     }
+    let host_id = match hostid::load_or_create(&paths.host_id()) {
+        Ok(id) => id,
+        Err(e) => {
+            log(paths, &format!("worker: host ID: {e}"));
+            return ExitCode::from(1);
+        }
+    };
     // One worker serves the socket: a second waits for the first to go.
     let lock_file = match OpenOptions::new()
         .create(true)
@@ -116,12 +130,16 @@ pub fn run(paths: &Paths) -> ExitCode {
     };
     let shared = Arc::new(Shared {
         paths: paths.clone(),
-        jobs: Arc::new(Jobs::new(paths.jobs(), config)),
+        jobs: Arc::new(Jobs::new(paths.jobs(), config.clone())),
+        sessions: Arc::new(Sessions::new(paths.sessions(), config)),
         uid: nix::unistd::getuid().as_raw(),
+        host_id,
+        path_env: std::env::var_os("PATH"),
     });
     runtime.block_on(serve(shared))
 }
 
+#[allow(clippy::too_many_lines)]
 async fn serve(shared: Arc<Shared>) -> ExitCode {
     let socket = shared.paths.socket();
     if let Ok(meta) = fs::symlink_metadata(&socket) {
@@ -154,11 +172,22 @@ async fn serve(shared: Arc<Shared>) -> ExitCode {
         &shared.paths,
         &format!("worker: serving {}", socket.display()),
     );
+    log(
+        &shared.paths,
+        &format!("worker: host ID {}", shared.host_id),
+    );
     {
         let jobs = Arc::clone(&shared.jobs);
+        let sessions = Arc::clone(&shared.sessions);
         let paths = shared.paths.clone();
         tokio::spawn(async move {
             loop {
+                let s = Arc::clone(&sessions);
+                if let Ok(removed) = tokio::task::spawn_blocking(move || s.gc()).await
+                    && removed > 0
+                {
+                    log(&paths, &format!("worker: removed {removed} ended sessions"));
+                }
                 let j = Arc::clone(&jobs);
                 if let Ok(collected) = tokio::task::spawn_blocking(move || j.gc()).await {
                     if collected.removed > 0 {
@@ -304,11 +333,125 @@ async fn hello(
     Ok(version.map(|v| (relay, v)))
 }
 
+/// An answer, in the connection's version.
+enum Answer {
+    V1(v1::ServerFrame),
+    V2(v2::ServerFrame),
+}
+
+impl Answer {
+    /// The answer's frame; one that does not fit is replaced by a
+    /// `TooLarge` refusal, `None` when even that cannot be encoded.
+    fn encode(self) -> Option<Vec<u8>> {
+        let refusal = |e: &ghostd_protocol::FrameError| {
+            format!("the answer does not fit a frame ({e}); ask for less")
+        };
+        match self {
+            Self::V1(frame) => encode_frame(&frame).ok().or_else(|| {
+                let v1::ServerFrame::Response { id, .. } = frame else {
+                    return None;
+                };
+                let e = encode_frame(&frame).err()?;
+                encode_frame(&v1::ServerFrame::Response {
+                    id,
+                    result: Err(err(ErrorKind::TooLarge, refusal(&e))),
+                })
+                .ok()
+            }),
+            Self::V2(frame) => encode_frame(&frame).ok().or_else(|| {
+                let v2::ServerFrame::Response { id, .. } = frame else {
+                    return None;
+                };
+                let e = encode_frame(&frame).err()?;
+                encode_frame(&v2::ServerFrame::Response {
+                    id,
+                    result: Err(v2::Error::new(v2::ErrorKind::TooLarge, refusal(&e))),
+                })
+                .ok()
+            }),
+        }
+    }
+
+    fn error(version: u32, id: u64, error: Error) -> Self {
+        if version >= v2::VERSION {
+            Self::V2(v2::ServerFrame::Response {
+                id,
+                result: Err(error.into()),
+            })
+        } else {
+            Self::V1(v1::ServerFrame::Response {
+                id,
+                result: Err(error),
+            })
+        }
+    }
+
+    fn protocol_error(version: u32, message: String) -> Self {
+        if version >= v2::VERSION {
+            Self::V2(v2::ServerFrame::ProtocolError { message })
+        } else {
+            Self::V1(v1::ServerFrame::ProtocolError { message })
+        }
+    }
+}
+
 /// What the writer task sends.
 enum Outgoing {
-    Frame(ServerFrame),
+    Frame(Answer),
     /// A protocol error: sent, then the connection is closed.
     Fatal(String),
+}
+
+/// A request, in the connection's version.
+enum Incoming {
+    V1(Request),
+    V2(v2::Request),
+}
+
+impl Incoming {
+    /// An upload's chunk, end or abort: carried out in order.
+    fn is_upload_step(&self) -> bool {
+        let request = match self {
+            Self::V1(r) | Self::V2(v2::Request::V1(r)) => r,
+            Self::V2(_) => return false,
+        };
+        matches!(
+            request,
+            Request::UploadChunk { .. } | Request::UploadEnd { .. } | Request::UploadAbort { .. }
+        )
+    }
+}
+
+/// Decodes a request frame of `version`: its ID, the host it expects
+/// and the request.
+fn decode_request(
+    version: u32,
+    body: &[u8],
+) -> Result<(u64, Option<HostId>, Incoming), ghostd_protocol::FrameError> {
+    if version >= v2::VERSION {
+        let v2::ClientFrame::Request {
+            id,
+            expected_host,
+            body,
+        } = decode::<v2::ClientFrame>(body)?;
+        Ok((id, expected_host, Incoming::V2(body)))
+    } else {
+        let v1::ClientFrame::Request { id, body } = decode::<v1::ClientFrame>(body)?;
+        Ok((id, None, Incoming::V1(body)))
+    }
+}
+
+async fn answer(shared: &Shared, uploads: &Arc<Uploads>, id: u64, request: Incoming) -> Answer {
+    match request {
+        Incoming::V1(request) => Answer::V1(v1::ServerFrame::Response {
+            id,
+            result: handle(shared, uploads, request).await,
+        }),
+        Incoming::V2(request) => Answer::V2(v2::ServerFrame::Response {
+            id,
+            result: handle_v2(shared, uploads, request).await,
+        }),
+    }
 }
 
 #[allow(clippy::too_many_lines)]
@@ -333,35 +476,16 @@ async fn connection(stream: UnixStream, shared: Arc<Shared>) {
             return;
         }
     };
-    // Only version 1 exists; a `v2` module would be dispatched on the
-    // agreed version here.
-    debug_assert_eq!(version, v1::VERSION);
     decoder.set_max(MAX_FRAME);
     let (tx, mut rx) = mpsc::channel::<Outgoing>(OUTGOING_QUEUE);
     let writer_task = tokio::spawn(async move {
         while let Some(out) = rx.recv().await {
             let (frame, fatal) = match out {
                 Outgoing::Frame(frame) => (frame, false),
-                Outgoing::Fatal(message) => (ServerFrame::ProtocolError { message }, true),
+                Outgoing::Fatal(message) => (Answer::protocol_error(version, message), true),
             };
-            let bytes = match encode_frame(&frame) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    let ServerFrame::Response { id, .. } = frame else {
-                        continue;
-                    };
-                    let refusal = ServerFrame::Response {
-                        id,
-                        result: Err(err(
-                            ErrorKind::TooLarge,
-                            format!("the answer does not fit a frame ({e}); ask for less"),
-                        )),
-                    };
-                    let Ok(bytes) = encode_frame(&refusal) else {
-                        continue;
-                    };
-                    bytes
-                }
+            let Some(bytes) = frame.encode() else {
+                continue;
             };
             if writer.write_all(&bytes).await.is_err() {
                 return;
@@ -380,17 +504,15 @@ async fn connection(stream: UnixStream, shared: Arc<Shared>) {
     // time in the order they arrive, so that a client may send the chunks
     // without waiting for each answer. Everything else runs concurrently.
     let (upload_tx, mut upload_rx) =
-        mpsc::channel::<(u64, Request, OwnedSemaphorePermit)>(MAX_IN_FLIGHT);
+        mpsc::channel::<(u64, Incoming, OwnedSemaphorePermit)>(MAX_IN_FLIGHT);
     let upload_task = {
         let tx = tx.clone();
         let shared = Arc::clone(&shared);
         let uploads = Arc::clone(&uploads);
         tokio::spawn(async move {
             while let Some((id, request, permit)) = upload_rx.recv().await {
-                let result = handle(&shared, &uploads, request).await;
-                let _ = tx
-                    .send(Outgoing::Frame(ServerFrame::Response { id, result }))
-                    .await;
+                let answer = answer(&shared, &uploads, id, request).await;
+                let _ = tx.send(Outgoing::Frame(answer)).await;
                 drop(permit);
             }
         })
@@ -405,29 +527,47 @@ async fn connection(stream: UnixStream, shared: Arc<Shared>) {
                 break;
             }
         };
-        let (id, request) = match decode::<ClientFrame>(&body) {
-            Ok(ClientFrame::Request { id, body }) => (id, body),
+        let (id, expected_host, request) = match decode_request(version, &body) {
+            Ok(request) => request,
             Err(e) => {
                 log(&shared.paths, &format!("worker: client {label}: {e}"));
                 let _ = tx.send(Outgoing::Fatal(e.to_string())).await;
                 break;
             }
         };
-        let Ok(permit) = Arc::clone(&in_flight).try_acquire_owned() else {
-            let busy = ServerFrame::Response {
+        // Before anything else: a request meant for another machine runs
+        // nothing here.
+        if let Some(expected) = expected_host
+            && expected != shared.host_id
+        {
+            let mismatch = Answer::V2(v2::ServerFrame::Response {
                 id,
-                result: Err(err(
+                result: Err(v2::Error::new(
+                    v2::ErrorKind::HostMismatch,
+                    format!(
+                        "this ghostd's host ID is {}, the request expected {expected}: the name \
+                         or address now reaches another machine, or this machine's ghostd state \
+                         is new; nothing was run",
+                        shared.host_id
+                    ),
+                )),
+            });
+            let _ = tx.send(Outgoing::Frame(mismatch)).await;
+            continue;
+        }
+        let Ok(permit) = Arc::clone(&in_flight).try_acquire_owned() else {
+            let busy = Answer::error(
+                version,
+                id,
+                err(
                     ErrorKind::Busy,
                     format!("{MAX_IN_FLIGHT} requests are in flight on this connection"),
-                )),
-            };
+                ),
+            );
             let _ = tx.send(Outgoing::Frame(busy)).await;
             continue;
         };
-        if matches!(
-            request,
-            Request::UploadChunk { .. } | Request::UploadEnd { .. } | Request::UploadAbort { .. }
-        ) {
+        if request.is_upload_step() {
             // The permits bound the queue: this never waits.
             let _ = upload_tx.send((id, request, permit)).await;
             continue;
@@ -436,10 +576,8 @@ async fn connection(stream: UnixStream, shared: Arc<Shared>) {
         let shared = Arc::clone(&shared);
         let uploads = Arc::clone(&uploads);
         tokio::spawn(async move {
-            let result = handle(&shared, &uploads, request).await;
-            let _ = tx
-                .send(Outgoing::Frame(ServerFrame::Response { id, result }))
-                .await;
+            let answer = answer(&shared, &uploads, id, request).await;
+            let _ = tx.send(Outgoing::Frame(answer)).await;
             drop(permit);
         });
     }
@@ -451,6 +589,92 @@ async fn connection(stream: UnixStream, shared: Arc<Shared>) {
     drop(tx);
     let _ = writer_task.await;
     drop(uploads);
+}
+
+async fn blocking_v2<T, F>(f: F) -> Result<T, v2::Error>
+where
+    F: FnOnce() -> Result<T, v2::Error> + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|e| v2::Error::new(v2::ErrorKind::Internal, format!("a task failed: {e}")))?
+}
+
+/// A version 2 request: version 1's are carried out as version 1 does.
+async fn handle_v2(
+    shared: &Shared,
+    uploads: &Arc<Uploads>,
+    request: v2::Request,
+) -> Result<v2::Response, v2::Error> {
+    use v2::Request as R;
+    use v2::Response as A;
+    let sessions = Arc::clone(&shared.sessions);
+    match request {
+        R::V1(request) => handle(shared, uploads, request)
+            .await
+            .map(A::V1)
+            .map_err(v2::Error::from),
+        R::Identify => {
+            let host_id = shared.host_id;
+            blocking_v2(move || Ok(A::Identity(machine::identity(host_id)))).await
+        }
+        R::SessionStart(spec) => sessions
+            .start(spec)
+            .await
+            .map(|session_id| A::SessionStarted { session_id }),
+        R::SessionSend { session_id, input } => {
+            sessions.send(&session_id, input).await.map(|()| A::DONE)
+        }
+        R::SessionRead {
+            session_id,
+            wait_ms,
+            until,
+            scrollback_lines,
+        } => sessions
+            .read(&session_id, wait_ms, until, scrollback_lines)
+            .await
+            .map(A::Screen),
+        R::SessionResize {
+            session_id,
+            cols,
+            rows,
+        } => sessions
+            .resize(&session_id, cols, rows)
+            .await
+            .map(|()| A::DONE),
+        R::SessionSignal { session_id, signal } => {
+            sessions.signal(&session_id, signal).await.map(|()| A::DONE)
+        }
+        R::SessionList => blocking_v2(move || Ok(A::Sessions(sessions.list()))).await,
+        R::SessionClose {
+            session_id,
+            grace_ms,
+        } => sessions.close(session_id, grace_ms).await.map(A::Session),
+        R::SessionLogRead {
+            session_id,
+            offset,
+            max_len,
+        } => {
+            blocking_v2(move || {
+                sessions
+                    .log_read(&session_id, offset, max_len)
+                    .map(|slice| A::V1(Response::LogSlice(slice)))
+            })
+            .await
+        }
+        R::Wait(spec) => waits::wait(Arc::clone(&shared.jobs), sessions, spec)
+            .await
+            .map(|(met, elapsed_ms, detail)| A::Waited {
+                met,
+                elapsed_ms,
+                detail,
+            }),
+        R::MachineState => {
+            let path = shared.path_env.clone();
+            blocking_v2(move || Ok(A::Machine(Box::new(machine::state(path.as_deref()))))).await
+        }
+    }
 }
 
 async fn blocking<F>(f: F) -> Result<Response, Error>

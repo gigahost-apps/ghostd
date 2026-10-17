@@ -56,6 +56,9 @@ use crate::jobfiles::{
 use crate::procfs;
 use crate::util::now_ms;
 
+pub mod session;
+pub use session::{SOCKET, pty_exec, run as run_session};
+
 enum Event {
     Signal(i32),
     PipeClosed,
@@ -179,6 +182,8 @@ pub fn run(dir: &Path) -> ExitCode {
         stdout: StreamStatus::default(),
         stderr: StreamStatus::default(),
         log_error: None,
+        cols: None,
+        rows: None,
     };
     let mut child = match command(dir, &spec).and_then(|mut c| c.spawn()) {
         Ok(child) => child,
@@ -713,7 +718,7 @@ fn spawn_copier<R: Read + Send + 'static>(
 ) {
     let shared = Arc::clone(shared);
     thread::spawn(move || {
-        copy(&shared, pipe, stream);
+        copy(&shared, pipe, stream, |_| {});
         let _ = tx.send(Event::PipeClosed);
     });
 }
@@ -730,7 +735,8 @@ fn open_log(path: &Path) -> Option<File> {
 /// Copies a pipe to its log until EOF. It never stops reading while the
 /// pipe is open: when the disk fails, the bytes are dropped (and
 /// `log_error` says so) so that the program never blocks on a full pipe.
-fn copy<R: Read>(shared: &Shared, mut pipe: R, stream: Stream) {
+/// `seen` gets every chunk read, before it is written.
+fn copy<R: Read>(shared: &Shared, mut pipe: R, stream: Stream, mut seen: impl FnMut(&[u8])) {
     let path = shared.dir.join(log_name(stream));
     let mut file = open_log(&path);
     let mut size = file
@@ -745,6 +751,7 @@ fn copy<R: Read>(shared: &Shared, mut pipe: R, stream: Stream) {
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
         };
+        seen(&buf[..n]);
         let mut chunk = &buf[..n];
         while !chunk.is_empty() {
             let mut room = shared.log_max.saturating_sub(size);

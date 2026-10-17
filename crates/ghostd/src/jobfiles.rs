@@ -1,4 +1,7 @@
 //! The files of a job directory, shared by the worker and the shim.
+//! A session's directory (`<state>/sessions/<id>/`) holds the same files,
+//! its PTY's output as `stdout.log`, and `shim.sock` and `screen.json`
+//! (see [`crate::shim::run_session`]).
 //!
 //! `<state>/jobs/<id>/`: `spec.json` (what to run), `stdin` and `script`
 //! when given, `status.json` (written by the shim, atomically),
@@ -79,6 +82,11 @@ pub struct SpecFile {
     /// The SHA-256 of the request's `ExecSpec` (hex), to tell a repeat of
     /// a request with a client-chosen job ID from another request.
     pub spec_sha256: String,
+    /// A session's terminal size at its start (none for a job).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cols: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u16>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +145,11 @@ pub struct StatusFile {
     pub stdout: StreamStatus,
     pub stderr: StreamStatus,
     pub log_error: Option<String>,
+    /// A session's terminal size now (none for a job).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cols: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rows: Option<u16>,
 }
 
 impl StatusFile {

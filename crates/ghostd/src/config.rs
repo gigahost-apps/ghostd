@@ -22,6 +22,8 @@ pub struct Config {
     pub exec_retention_hours: u64,
     pub max_jobs_kept: u64,
     pub max_running_jobs: u64,
+    /// Sessions (PTYs) live at once.
+    pub max_sessions: u64,
 }
 
 impl Default for Config {
@@ -35,6 +37,7 @@ impl Default for Config {
             exec_retention_hours: 24,
             max_jobs_kept: 1000,
             max_running_jobs: 256,
+            max_sessions: 32,
         }
     }
 }
@@ -73,8 +76,8 @@ impl Config {
         if self.exec_timeout_ms == 0 || self.exec_timeout_ms > MAX_EXEC_TIMEOUT_MS {
             return Err(format!("exec_timeout_ms is 1..={MAX_EXEC_TIMEOUT_MS}"));
         }
-        if self.max_jobs_kept == 0 || self.max_running_jobs == 0 {
-            return Err("max_jobs_kept and max_running_jobs are at least 1".into());
+        if self.max_jobs_kept == 0 || self.max_running_jobs == 0 || self.max_sessions == 0 {
+            return Err("max_jobs_kept, max_running_jobs and max_sessions are at least 1".into());
         }
         Ok(())
     }
@@ -108,6 +111,10 @@ pub const TEMPLATE: &str = "\
 
 # Starting more jobs than this at once is refused.
 # max_running_jobs = 256
+
+# Starting more sessions (terminals) than this at once is refused. Ended
+# sessions are kept as long as finished execs.
+# max_sessions = 32
 ";
 
 #[cfg(test)]

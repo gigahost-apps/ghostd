@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 /// The lowest protocol version this build speaks.
 pub const PROTOCOL_MIN: u32 = 1;
 /// The highest protocol version this build speaks.
-pub const PROTOCOL_MAX: u32 = 1;
+pub const PROTOCOL_MAX: u32 = 2;
 
 /// The 16 bytes a server sends before its [`ServerHello`] frame, on every
 /// connection. A client discards whatever comes before them (a login

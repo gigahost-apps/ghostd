@@ -97,17 +97,28 @@ impl Paths {
     }
 
     #[must_use]
+    pub fn sessions(&self) -> PathBuf {
+        self.state.join("sessions")
+    }
+
+    /// The daemon's host ID (see [`crate::hostid`]).
+    #[must_use]
+    pub fn host_id(&self) -> PathBuf {
+        self.state.join("host-id")
+    }
+
+    #[must_use]
     pub fn install_record(&self) -> PathBuf {
         self.state.join("install.json")
     }
 
-    /// Creates the state, jobs and runtime directories, 0700.
+    /// Creates the state, jobs, sessions and runtime directories, 0700.
     ///
     /// # Errors
     ///
     /// When a directory cannot be created or restricted.
     pub fn ensure(&self) -> io::Result<()> {
-        for dir in [&self.state, &self.jobs(), &self.runtime] {
+        for dir in [&self.state, &self.jobs(), &self.sessions(), &self.runtime] {
             private_dir(dir)?;
         }
         Ok(())

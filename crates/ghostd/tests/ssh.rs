@@ -15,8 +15,10 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use common::{EXE, Env, exec};
+use ghostd_client::ClientError;
 use ghostd_client::Connection;
 use ghostd_protocol::v1::{ExecSpec, Outcome, Program, Request, Response};
+use ghostd_protocol::v2;
 
 const SSHD: &str = "/usr/sbin/sshd";
 
@@ -169,4 +171,35 @@ SetEnv GHOSTD_STATE_DIR={state} GHOSTD_RUNTIME_DIR={runtime} GHOSTD_CONFIG={conf
         .flat_map(|a| a.iter().copied().chain(std::iter::once(0)))
         .collect();
     assert_eq!(r.stdout.data, expected);
+
+    // Version 2 over SSH: the host ID, sent with an exec.
+    assert_eq!(c.version(), 2);
+    let v2::Response::Identity(identity) = c.call(v2::Request::Identify).await.unwrap() else {
+        panic!("no identity");
+    };
+    c.set_expected_host(Some(identity.host_id));
+    let r = exec(
+        &c,
+        ExecSpec {
+            program: Program::Argv(vec![b"echo".to_vec(), b"checked".to_vec()]),
+            ..ExecSpec::default()
+        },
+    )
+    .await;
+    assert_eq!(r.stdout.data, b"checked\n");
+    let e = c
+        .call_expecting(
+            Request::Exec(ExecSpec {
+                program: Program::Argv(vec![b"touch".to_vec(), b"swapped".to_vec()]),
+                ..ExecSpec::default()
+            }),
+            Some(v2::HostId([0xee; 16])),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&e, ClientError::Remote(r) if r.kind == v2::ErrorKind::HostMismatch),
+        "{e}"
+    );
+    assert!(!env.home.join("swapped").exists());
 }

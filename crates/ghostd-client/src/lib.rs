@@ -6,6 +6,14 @@
 //! scans for the marker (skipping a login shell's banner), negotiates the
 //! protocol version and then answers [`Connection::call`]s, many at once,
 //! over the one stream.
+//!
+//! It speaks protocol versions 1 and 2. A call takes a version 1 request
+//! (answered with version 1's response) or a version 2 one; on a
+//! connection agreed at version 1 a version 2 request that exists in
+//! version 1 ([`v2::Request::V1`]) is sent as version 1, and any other is
+//! refused before anything is sent. The expected host ID
+//! ([`Connection::set_expected_host`]) needs version 2: with version 1 it
+//! is not sent, and [`Connection::host_check`] says so.
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
@@ -14,11 +22,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ghostd_protocol::v1::{self, ClientFrame, Request, Response, ServerFrame};
+use ghostd_protocol::v2::HostId;
 use ghostd_protocol::{
     ClientHello, FrameDecoder, FrameError, HelloAnswer, MAX_FRAME, MAX_HELLO_FRAME, MarkerScan,
     MarkerScanner, PROTOCOL_MAX, PROTOCOL_MIN, ServerHello, decode, encode_frame,
 };
+use ghostd_protocol::{v1, v2};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{mpsc, oneshot};
@@ -58,9 +67,10 @@ pub enum ClientError {
     /// The request needs a newer version than the connection speaks.
     #[error(transparent)]
     Unsupported(#[from] v1::UnsupportedVersion),
-    /// The server answered the request with an error.
+    /// The server answered the request with an error (a version 1 error
+    /// converted).
     #[error("{0}")]
-    Remote(v1::Error),
+    Remote(v2::Error),
     /// The connection is closed; every pending and later call fails.
     #[error("connection closed: {0}")]
     Closed(String),
@@ -101,7 +111,52 @@ impl Default for Options {
     }
 }
 
-type Answer = Result<Result<Response, v1::Error>, ClientError>;
+type Answer = Result<Result<v2::Response, v2::Error>, ClientError>;
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for ghostd_protocol::v1::Request {}
+    impl Sealed for ghostd_protocol::v2::Request {}
+}
+
+/// A request [`Connection::call`] sends: a version 1 one (answered with a
+/// version 1 response) or a version 2 one.
+pub trait Call: sealed::Sealed {
+    type Response;
+    #[doc(hidden)]
+    fn into_v2(self) -> v2::Request;
+    #[doc(hidden)]
+    fn from_v2(response: v2::Response) -> Result<Self::Response, ClientError>;
+}
+
+impl Call for v1::Request {
+    type Response = v1::Response;
+
+    fn into_v2(self) -> v2::Request {
+        v2::Request::V1(self)
+    }
+
+    fn from_v2(response: v2::Response) -> Result<v1::Response, ClientError> {
+        match response {
+            v2::Response::V1(response) => Ok(response),
+            other => Err(ClientError::Protocol(format!(
+                "a version 2 answer to a version 1 request: {other:?}"
+            ))),
+        }
+    }
+}
+
+impl Call for v2::Request {
+    type Response = v2::Response;
+
+    fn into_v2(self) -> v2::Request {
+        self
+    }
+
+    fn from_v2(response: v2::Response) -> Result<v2::Response, ClientError> {
+        Ok(response)
+    }
+}
 
 #[derive(Default)]
 struct Pending {
@@ -134,6 +189,7 @@ pub struct Connection {
     next_id: AtomicU64,
     version: u32,
     server_version: String,
+    expected_host: Mutex<Option<HostId>>,
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
     child: Option<Child>,
@@ -200,7 +256,7 @@ impl Connection {
         let (version, server_version, decoder) =
             handshake(&mut reader, &mut writer, &options).await?;
         let pending = Arc::new(Mutex::new(Pending::default()));
-        let reader = tokio::spawn(read_loop(reader, decoder, Arc::clone(&pending)));
+        let reader = tokio::spawn(read_loop(reader, decoder, version, Arc::clone(&pending)));
         let (outgoing, queue) = mpsc::channel(OUTGOING_QUEUE);
         let writer = tokio::spawn(write_loop(writer, queue, Arc::clone(&pending)));
         Ok(Self {
@@ -209,6 +265,7 @@ impl Connection {
             next_id: AtomicU64::new(1),
             version,
             server_version,
+            expected_host: Mutex::new(None),
             reader,
             writer,
             child: None,
@@ -301,20 +358,79 @@ impl Connection {
         &self.server_version
     }
 
+    /// Whether the server checks the expected host ID
+    /// ([`Connection::set_expected_host`]): from protocol version 2.
+    #[must_use]
+    pub fn host_check(&self) -> bool {
+        self.version >= v2::VERSION
+    }
+
+    /// The server's host ID every later call names as the one it expects
+    /// (`None`: no check). A server with another ID answers
+    /// [`v2::ErrorKind::HostMismatch`] and runs nothing. Not sent on a
+    /// version 1 connection (see [`Connection::host_check`]).
+    pub fn set_expected_host(&self, host: Option<HostId>) {
+        *self
+            .expected_host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = host;
+    }
+
+    /// The host ID set by [`Connection::set_expected_host`].
+    #[must_use]
+    pub fn expected_host(&self) -> Option<HostId> {
+        *self
+            .expected_host
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// Sends a request and waits for its answer. Many calls may run at
     /// once; answers are paired by request ID. Dropping the future (a
     /// timeout) is safe: the request is then either not sent at all or
-    /// sent whole, and the connection stays usable.
+    /// sent whole, and the connection stays usable. It carries the
+    /// expected host ID when one is set and the connection speaks
+    /// version 2.
     ///
     /// # Errors
     ///
     /// [`ClientError::Remote`] for the server's error answer, others when
     /// the request is too new for the connection or the connection fails.
-    pub async fn call(&self, request: Request) -> Result<Response, ClientError> {
+    pub async fn call<R: Call>(&self, request: R) -> Result<R::Response, ClientError> {
+        let expected = self.expected_host();
+        self.call_expecting(request, expected).await
+    }
+
+    /// [`Connection::call`] naming `expected_host` for this call only.
+    ///
+    /// # Errors
+    ///
+    /// As [`Connection::call`].
+    pub async fn call_expecting<R: Call>(
+        &self,
+        request: R,
+        expected_host: Option<HostId>,
+    ) -> Result<R::Response, ClientError> {
+        let request = request.into_v2();
         v1::ensure_supported(request.min_version(), self.version)?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let frame = encode_frame(&ClientFrame::Request { id, body: request })
-            .map_err(|e| ClientError::Protocol(e.to_string()))?;
+        let encoded = if self.version >= v2::VERSION {
+            encode_frame(&v2::ClientFrame::Request {
+                id,
+                expected_host,
+                body: request,
+            })
+        } else {
+            let v2::Request::V1(body) = request else {
+                // ensure_supported let only version 1 requests through.
+                return Err(ClientError::Unsupported(v1::UnsupportedVersion {
+                    required: v2::VERSION,
+                    agreed: self.version,
+                }));
+            };
+            encode_frame(&v1::ClientFrame::Request { id, body })
+        };
+        let frame = encoded.map_err(|e| ClientError::Protocol(e.to_string()))?;
         let (tx, rx) = oneshot::channel();
         {
             let mut pending = lock(&self.pending);
@@ -333,7 +449,7 @@ impl Connection {
             return Err(self.closed_error());
         }
         match rx.await {
-            Ok(Ok(Ok(response))) => Ok(response),
+            Ok(Ok(Ok(response))) => R::from_v2(response),
             Ok(Ok(Err(remote))) => Err(ClientError::Remote(remote)),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(self.closed_error()),
@@ -533,9 +649,24 @@ async fn handshake<R: AsyncRead + Unpin>(
     }
 }
 
+/// A server frame of either version, as version 2's.
+fn decode_server_frame(body: &[u8], version: u32) -> Result<v2::ServerFrame, FrameError> {
+    if version >= v2::VERSION {
+        return decode::<v2::ServerFrame>(body);
+    }
+    Ok(match decode::<v1::ServerFrame>(body)? {
+        v1::ServerFrame::Response { id, result } => v2::ServerFrame::Response {
+            id,
+            result: result.map(v2::Response::V1).map_err(v2::Error::from),
+        },
+        v1::ServerFrame::ProtocolError { message } => v2::ServerFrame::ProtocolError { message },
+    })
+}
+
 async fn read_loop<R: AsyncRead + Unpin>(
     mut reader: R,
     mut decoder: FrameDecoder,
+    version: u32,
     pending: Arc<Mutex<Pending>>,
 ) {
     let mut buf = vec![0u8; 64 * 1024];
@@ -545,14 +676,14 @@ async fn read_loop<R: AsyncRead + Unpin>(
             Ok(None) => break ClientError::Closed("the server closed the connection".into()),
             Err(e) => break e,
         };
-        match decode::<ServerFrame>(&body) {
-            Ok(ServerFrame::Response { id, result }) => {
+        match decode_server_frame(&body, version) {
+            Ok(v2::ServerFrame::Response { id, result }) => {
                 let waiter = lock(&pending).waiting.remove(&id);
                 if let Some(tx) = waiter {
                     let _ = tx.send(Ok(result));
                 }
             }
-            Ok(ServerFrame::ProtocolError { message }) => {
+            Ok(v2::ServerFrame::ProtocolError { message }) => {
                 break ClientError::Protocol(format!("the server reported: {message}"));
             }
             Err(e) => break ClientError::Protocol(e.to_string()),
