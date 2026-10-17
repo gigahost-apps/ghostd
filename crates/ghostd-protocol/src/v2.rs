@@ -65,7 +65,7 @@ impl FromStr for HostId {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
-        if s.len() != 32 || !s.is_ascii() {
+        if s.len() != 32 || !s.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(BadHostId);
         }
         let mut out = [0u8; 16];
