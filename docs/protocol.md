@@ -69,7 +69,8 @@ sees or sends it.
   (`Request::min_version`); a client refuses to send a request newer than
   the agreed version instead of letting the server misread it.
 
-This build speaks version 1 only.
+This build speaks versions 1 and 2 (`PROTOCOL_MIN = 1`, `PROTOCOL_MAX =
+2`). A connection agreed at version 1 behaves exactly as ghostd 0.1 did.
 
 ## Version 1
 
@@ -199,3 +200,138 @@ its ID is free again.
 An answer that would not fit a frame (a huge listing) is replaced by a
 `TooLarge` error; listings and searches stop at about 12 MiB and say
 `truncated`.
+
+## Version 2
+
+Version 2 is version 1 plus the host ID check, sessions (persistent
+PTYs), waits and the machine's state. Version 1's requests travel wrapped
+and keep their types and their meaning; their bytes are version 1's,
+after one variant index.
+
+- The client sends `ClientFrame::Request { id: u64, expected_host:
+  Option<HostId>, body: Request }`; the server answers `ServerFrame` as in
+  version 1, with version 2's `Response` and `Error`.
+- `Request` is `V1(v1::Request)` (answered `Response::V1(v1::Response)`)
+  or one of the requests below.
+- `Error { kind, message, os_code }`, `kind` version 1's kinds, in the same
+  order, then `HostMismatch`.
+- A client on a version 1 connection sends a `V1` request as a version 1
+  frame and refuses every other request before sending anything.
+
+### The host ID
+
+A `HostId` is 16 random bytes (shown as 32 hex digits) that the worker
+makes the first time it starts with none and keeps in `<state>/host-id`
+(0600, written atomically). It is never made again while the file exists,
+so it stays across daemon restarts, updates and reboots, and it changes
+when the machine or its ghostd state is new: a reinstall, a swapped disk,
+another machine behind the same name or address, another user's daemon. A
+file that holds no host ID stops the worker (it says so in `ghostd.log`)
+instead of being replaced.
+
+Every request may carry the `expected_host` a client learned before. When
+it is `Some` and not this daemon's ID, the request is answered
+`HostMismatch` (naming both IDs) before anything else is done: nothing
+runs, nothing is created, also for a version 1 request in a `V1`. `None`
+skips the check.
+
+| Request | Answer | Notes |
+|---|---|---|
+| `Identify` | `Identity { host_id, hostname, machine_id, boot_id, program_version, uid }` | `machine_id` from `/etc/machine-id`, `boot_id` from `/proc/sys/kernel/random/boot_id` (new on every boot), when readable. |
+
+### Sessions
+
+A session is a program on a PTY of its own, held by a shim like a job's
+(`ghostd shim <dir> --session`, in `<state>/sessions/<id>/`), so it
+survives the connection, the worker's and the daemon's crashes, and is
+reached again by its ID on any connection. The shim reads the PTY all the
+time, so a program that floods output while nobody looks never blocks:
+the output goes to a terminal emulator (the screen and 1000 lines of
+scrollback) and to a rotated log (`log_max_bytes`). It makes the PTY the
+program's controlling terminal in a session of its own (`TERM` is
+`xterm-256color` unless the spec sets it).
+
+`SessionSpec { argv, env, env_remove, cwd, cols, rows, session_id, name }`:
+`argv` `None` runs the user's login shell (`$SHELL -l`, else `/bin/sh -l`);
+the environment is the daemon's, then `env_remove`, then `env`; `cwd`
+defaults to `$HOME`; `cols` 20..=500 (default 120), `rows` 5..=200
+(default 40); `session_id` is chosen by the client as `job_id` is (`s` and
+16 random lowercase hex digits): the same request again answers the
+session it started, another request under its ID is refused with
+`Conflict`.
+
+No process is leaked, as for jobs: when the program ends by itself, what it
+left in its session is stopped half a second later (as after an `Exec`),
+and a close stops the whole tree. An ended session keeps its final screen
+(`screen.json`) and its log until it is collected, as a finished exec is
+(`exec_retention_hours`, `max_jobs_kept`). At most `max_sessions` (32)
+run at once.
+
+| Request | Answer | Notes |
+|---|---|---|
+| `SessionStart(SessionSpec)` | `SessionStarted { session_id }` | Once the program runs; a program that cannot start is `NotFound` with why. `Busy` at `max_sessions`. |
+| `SessionSend { session_id, input: [Key] }` | `V1(Done)` | `Key` is `Text(String)`, `Bytes(bytes)` or `Named(NamedKey)`: `Enter`, `Tab`, `Escape`, `Backspace`, `Delete`, `Up`, `Down`, `Left`, `Right`, `Home`, `End`, `PageUp`, `PageDown`, `Insert`, `F1`–`F12`, `Ctrl(char)` (a letter, `[`, `\`, `]`, `^`, `_`), `Alt(char)`, sent as an xterm sends them (the arrows, Home and End as `ESC O x` in the application cursor-key mode the program set). At most 64 KiB per send; `Busy` while the program has not read what was sent before; `Conflict` once it has exited. |
+| `SessionRead { session_id, wait_ms, until, scrollback_lines }` | `Screen` | Without `until`, at once; with it, when it holds or at `wait_ms` (at most 60 s). `Until` is `Changed { since }` (output after the sequence number `since`, `None`: after the request came), `Matches(regex)` (over the screen's text, Rust `regex` syntax) or `Exited`. `scrollback_lines` at most 1000. |
+| `SessionResize { session_id, cols, rows }` | `V1(Done)` | The program gets `SIGWINCH`. |
+| `SessionSignal { session_id, signal }` | `V1(Done)` | To the PTY's foreground process group (the job a shell runs), else the program's. `Conflict` once it has exited. |
+| `SessionList` | `Sessions([SessionInfo])` | Live and ended, newest first. `SessionInfo { session_id, name, argv_summary, state, started_at_ms, ended_at_ms, pid, cols, rows, output_total, finished }`, `state` as a job's. |
+| `SessionClose { session_id, grace_ms }` | `Session(SessionInfo)` | `SIGHUP` to the program's group, then the whole tree stopped as `JobStop` does; answers once all is gone. The final screen stays readable. |
+| `SessionLogRead { session_id, offset, max_len }` | `V1(LogSlice)` | The raw output, as `JobLogRead`. |
+
+`Screen { text, cursor, cols, rows, title, alternate_screen, scrollback,
+exited, changed_since, until_met }`: `text` is the rows joined with `\n`,
+each without its trailing spaces; `cursor` (row, column) from 0; `title`
+what the program set; `alternate_screen` true while a full-screen program
+(`vi`, `less`, `top`) runs; `scrollback` the lines above the screen, oldest
+first, when asked for; `exited` `Exited { code }` or `Signaled { signal }`
+once the program has ended; `changed_since` a sequence number bumped on
+every output and resize; `until_met` whether `until` held (`None` without
+one).
+
+### Waits
+
+`Wait(WaitSpec { condition, timeout_ms, interval_ms })` waits on the
+machine and answers `Waited { met, elapsed_ms, detail }` when the condition
+holds or at `timeout_ms` (at most 300 000), looking every `interval_ms`
+(default 250, at least 50). `detail` says what it saw last. A condition
+that does not hold yet is never an error; a bad argument, an unknown job or
+session is.
+
+| `Condition` | Holds when |
+|---|---|
+| `PortOpen { host, port }` | A TCP connection to `host` (default `127.0.0.1`) succeeds, each try within 5 s. |
+| `HttpStatus { url, status }` | A `GET` of a plain `http://` URL (`Connection: close`, 5 s per try) answers `status`, default any 2xx or 3xx. `https://` is refused with `InvalidArgument`: wait with `PortOpen`, or exec `curl`. |
+| `FileExists { path }` | The path exists. |
+| `FileContains { path, regex }` | The regex matches the file's last 1 MiB. |
+| `LogMatches { source, stream, regex, from_offset }` | The regex matches output of `Job(id)` (`stream`) or `Session(id)` written after `from_offset` (default: the stream's total when the wait began), within 64 KiB. Once the job or session has ended with no match, it answers at once. |
+| `ProcessGone { pid, start_time }` | No process `pid` runs; with `start_time` (clock ticks since boot, field 22 of `/proc/<pid>/stat`) one that reused the pid does not count. |
+| `JobFinished { job_id }` | The job is `finished`. |
+| `SessionExited { session_id }` | The session's program has ended. |
+
+### The machine's state
+
+`MachineState` answers `Machine { hostname, os, kernel, arch, uptime_s,
+load, cpus, memory, disks, listening, failing_units, kernel_errors,
+journal_errors, notes }`:
+
+- `os` is `PRETTY_NAME` of `/etc/os-release`, `kernel` `uname -r`, `load`
+  the 1, 5 and 15 minute averages, `cpus` the online CPUs;
+- `memory { total, available, swap_total, swap_free }` in bytes, from
+  `/proc/meminfo`;
+- `disks [{ mount, fs, device, total, free, used_pct }]`: the real
+  filesystems of `/proc/self/mountinfo` (no `proc`, `sysfs`, `cgroup`,
+  squashfs snaps, other containers' overlays, nor `tmpfs` but `/tmp` and
+  `/dev/shm`), a bind mount once, `used_pct` as `df` counts it;
+- `listening [{ proto, address, port, pid, process }]`: TCP sockets in
+  `LISTEN` and unconnected UDP ones, from `/proc/net`, with the process
+  where `/proc/<pid>/fd` is readable (the daemon's user's own, all as
+  root);
+- `failing_units`: `systemctl --failed`, `None` without systemd;
+- `kernel_errors`: the last 20 of `dmesg --level=emerg,alert,crit,err`, else
+  of `/dev/kmsg`; `journal_errors`: the last 20 of `journalctl -p err`;
+- `notes`: what could not be read and why.
+
+A part that cannot be read never fails the answer: it is left empty and
+`notes` says why. Commands run by their argv with `LC_ALL=C`, a 5 s
+timeout and their output capped.
+

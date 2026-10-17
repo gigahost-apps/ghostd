@@ -2,8 +2,9 @@
 
 A daemon on a Linux machine for AI agents to work on it: commands as
 argument arrays with structured results, jobs that outlive the connection,
-and file reads, writes and edits, reached over the machine's own SSH with
-no quoting and one kept connection.
+file reads, writes and edits, terminal sessions read as screens, waits done
+on the machine and its state in one call, reached over the machine's own
+SSH with no quoting and one kept connection.
 
 It is one binary that needs no service manager:
 `ghostd stdio`, the command a client runs over the user's own SSH access,
@@ -83,6 +84,43 @@ waited for (a stop or timeout before the job finishes takes the whole tree,
 detached processes included), and a service started with `systemctl start` is systemd's, not the
 job's.
 
+## Sessions
+
+A session is a program on a terminal (PTY) of its own: a shell, a REPL,
+`top`, an installer that asks questions. It is read as a screen in text
+(with the cursor, the title, whether a full-screen program switched to the
+alternate screen, and up to 1000 lines of scrollback) and typed into as
+text, bytes or named keys (`Enter`, `Ctrl('c')`, the arrows, `F1`–`F12`).
+A read can wait until the screen changes, a regex matches it or the
+program exits. Like a job, a session runs under its own supervisor
+process: it survives the connection and the daemon's crashes and is found
+again by its ID; closing it stops everything it started, and when its
+program exits what it left in the background is stopped. Its final screen
+and its raw output are kept until it is collected. At most 32 run at once
+(`max_sessions`).
+
+## Waits and the machine's state
+
+`Wait` waits on the machine, so one request replaces a polling loop: until
+a port accepts connections, an `http://` URL answers a status, a file
+appears or holds a regex, a job's or a session's output matches, a
+process, a job or a session ends, up to a timeout (at most 5 minutes).
+`MachineState` answers the system, uptime, load, memory, disks, listening
+ports with their processes, failing systemd units and the kernel's and
+the journal's recent errors in one call; a part that cannot be read is a
+note, never a failure.
+
+## The host ID
+
+The daemon makes a random host ID the first time it starts and keeps it in
+`<state>/host-id`. It stays across restarts, updates and reboots, and
+changes only with the machine or its ghostd state (a reinstall, a swapped
+disk, another machine behind the same name or address, another user's
+daemon). A client that kept it sends it with its requests: a daemon with
+another ID answers `HostMismatch` and runs nothing, so a request never
+lands on the wrong machine. Remove the file only to make the machine a new
+one: every client that knew the old ID refuses it until it forgets it.
+
 ## Commands
 
 | Command | |
@@ -98,7 +136,7 @@ job's.
 
 | | As a user | As root |
 |---|---|---|
-| State: jobs, logs, `ghostd.log`, `install.json` | `$XDG_STATE_HOME/ghostd` (`~/.local/state/ghostd`) | `/var/lib/ghostd` |
+| State: jobs, sessions, logs, `ghostd.log`, `install.json`, `host-id` | `$XDG_STATE_HOME/ghostd` (`~/.local/state/ghostd`) | `/var/lib/ghostd` |
 | Socket, lock and pid file | `$XDG_RUNTIME_DIR/ghostd`, else `<state>/run` | `/run/ghostd` |
 | Configuration | `$XDG_CONFIG_HOME/ghostd/config.toml` (`~/.config/ghostd/config.toml`) | `/etc/ghostd/config.toml` |
 

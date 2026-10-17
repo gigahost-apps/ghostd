@@ -20,6 +20,8 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
         run: cargo test --workspace
+      - name: Version 1's tests as a version 1 client
+        run: GHOSTD_TEST_PROTOCOL_MAX=1 cargo test -p ghostd --test exec --test jobs --test files --test protocol
       - name: sshd for the SSH test
         run: sudo apt-get update && sudo apt-get install -y openssh-server
       - name: SSH test
