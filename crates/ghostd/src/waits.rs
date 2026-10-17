@@ -1,12 +1,15 @@
 //! `Wait`: a condition looked at on the machine until it holds or the
 //! timeout, so that one request replaces a client's polling loop. Each look
 //! is bounded: a connection attempt or an HTTP request takes at most 5 s, a
-//! file is read at most 1 MiB from its end, a log at most 1 MiB per read
-//! with 64 KiB carried over between reads. Nothing runs a shell.
+//! file is read at most 1 MiB from its end (a regular file only, opened
+//! without blocking), a log at most 1 MiB per read with 64 KiB carried over
+//! between reads, and a look that reads files never outlasts the wait's
+//! timeout (a hung mount). Nothing runs a shell.
 
-use std::fs::File;
+use std::fs::OpenOptions;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -224,6 +227,21 @@ enum Check {
     SessionExited(String),
 }
 
+impl Check {
+    /// What the check looks at, for a detail.
+    fn subject(&self) -> String {
+        match self {
+            Self::Port { host, port } => format!("{host} port {port}"),
+            Self::Http { url, .. } => format!("http://{}{}", url.authority, url.target),
+            Self::FileExists(path) | Self::FileContains(path, _) => path.display().to_string(),
+            Self::Log(log) => format!("the log of {}", log.what),
+            Self::ProcessGone { pid, .. } => format!("process {pid}"),
+            Self::JobFinished(id) => format!("job {id}"),
+            Self::SessionExited(id) => format!("session {id}"),
+        }
+    }
+}
+
 struct LogCheck {
     dir: PathBuf,
     stream: Stream,
@@ -280,12 +298,37 @@ impl LogCheck {
     }
 }
 
-fn file_tail_matches(path: &PathBuf, regex: &regex::bytes::Regex) -> Look {
-    let mut file = match File::open(path) {
+fn not_regular(path: &Path) -> Look {
+    Look::not_yet(format!(
+        "{} is not a regular file (FileContains reads regular files only)",
+        path.display()
+    ))
+}
+
+fn file_tail_matches(path: &Path, regex: &regex::bytes::Regex) -> Look {
+    // A regular file only: opening a FIFO waits for a writer, and a device
+    // may never end.
+    match std::fs::metadata(path) {
+        Ok(meta) if meta.is_file() => {}
+        Ok(_) => return not_regular(path),
+        Err(e) => return Look::not_yet(format!("{}: {e}", path.display())),
+    }
+    // Without blocking and without taking a terminal, should the path have
+    // been replaced since.
+    let flags = nix::fcntl::OFlag::O_NONBLOCK | nix::fcntl::OFlag::O_NOCTTY;
+    let mut file = match OpenOptions::new()
+        .read(true)
+        .custom_flags(flags.bits())
+        .open(path)
+    {
         Ok(file) => file,
         Err(e) => return Look::not_yet(format!("{}: {e}", path.display())),
     };
-    let len = file.metadata().map_or(0, |m| m.len());
+    let len = match file.metadata() {
+        Ok(meta) if meta.is_file() => meta.len(),
+        Ok(_) => return not_regular(path),
+        Err(e) => return Look::not_yet(format!("{}: {e}", path.display())),
+    };
     let from = len.saturating_sub(FILE_TAIL);
     if file.seek(SeekFrom::Start(from)).is_err() {
         return Look::not_yet(format!("{}: cannot seek", path.display()));
@@ -477,6 +520,7 @@ pub async fn wait(
         .await
         .map_err(|e| err(ErrorKind::Internal, format!("a task failed: {e}")))??;
     let elapsed = || u64::try_from(begun.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let subject = check.subject();
     loop {
         let budget = deadline
             .saturating_duration_since(Instant::now())
@@ -500,12 +544,25 @@ pub async fn wait(
             },
             _ => {
                 let w = Arc::clone(&waiter);
-                let (back, look) = tokio::task::spawn_blocking(move || {
+                let task = tokio::task::spawn_blocking(move || {
                     let look = w.look_blocking(&mut check);
                     (check, look)
-                })
-                .await
-                .map_err(|e| err(ErrorKind::Internal, format!("a task failed: {e}")))?;
+                });
+                // A look that hangs (a mount that does not answer) does not
+                // hold the wait past its timeout: it answers then, and the
+                // blocked thread ends whenever the look does.
+                let remaining = deadline
+                    .saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(MIN_INTERVAL_MS));
+                let Ok(joined) = tokio::time::timeout(remaining, task).await else {
+                    return Ok((
+                        false,
+                        elapsed(),
+                        format!("{subject}: the look did not finish within the timeout"),
+                    ));
+                };
+                let (back, look) =
+                    joined.map_err(|e| err(ErrorKind::Internal, format!("a task failed: {e}")))?;
                 check = back;
                 look?
             }

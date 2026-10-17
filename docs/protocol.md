@@ -295,14 +295,15 @@ machine and answers `Waited { met, elapsed_ms, detail }` when the condition
 holds or at `timeout_ms` (at most 300 000), looking every `interval_ms`
 (default 250, at least 50). `detail` says what it saw last. A condition
 that does not hold yet is never an error; a bad argument, an unknown job or
-session is.
+session is. A look that reads files and hangs (a mount that does not
+answer) does not hold the answer past `timeout_ms`.
 
 | `Condition` | Holds when |
 |---|---|
 | `PortOpen { host, port }` | A TCP connection to `host` (default `127.0.0.1`) succeeds, each try within 5 s. |
 | `HttpStatus { url, status }` | A `GET` of a plain `http://` URL (`Connection: close`, 5 s per try) answers `status`, default any 2xx or 3xx. `https://` is refused with `InvalidArgument`: wait with `PortOpen`, or exec `curl`. |
 | `FileExists { path }` | The path exists. |
-| `FileContains { path, regex }` | The regex matches the file's last 1 MiB. |
+| `FileContains { path, regex }` | The regex matches the file's last 1 MiB. Only a regular file is read (opened without blocking): a FIFO or a device does not hold, and the detail says so. |
 | `LogMatches { source, stream, regex, from_offset }` | The regex matches output of `Job(id)` (`stream`) or `Session(id)` written after `from_offset` (default: the stream's total when the wait began), within 64 KiB. Once the job or session has ended with no match, it answers at once. |
 | `ProcessGone { pid, start_time }` | No process `pid` runs; with `start_time` (clock ticks since boot, field 22 of `/proc/<pid>/stat`) one that reused the pid does not count. |
 | `JobFinished { job_id }` | The job is `finished`. |

@@ -237,6 +237,57 @@ async fn a_file_appears_and_fills() {
 }
 
 #[tokio::test]
+async fn a_fifo_or_a_device_keeps_to_the_timeout() {
+    let env = Env::new();
+    let c = env.connect_v2().await;
+    // Opening a FIFO for reading waits for a writer, which never comes.
+    nix::unistd::mkfifo(
+        &env.home.join("fifo"),
+        nix::sys::stat::Mode::from_bits_truncate(0o600),
+    )
+    .unwrap();
+    let (met, _, detail) = wait(
+        &c,
+        Condition::FileExists {
+            path: b"fifo".to_vec(),
+        },
+        1000,
+    )
+    .await;
+    assert!(met, "{detail}");
+    for path in [&b"fifo"[..], b"/dev/zero"] {
+        let begun = Instant::now();
+        let answered = tokio::time::timeout(
+            Duration::from_secs(10),
+            wait(
+                &c,
+                Condition::FileContains {
+                    path: path.to_vec(),
+                    regex: "x".into(),
+                },
+                1000,
+            ),
+        )
+        .await;
+        let (met, elapsed, detail) = answered.expect("the wait outlasted its timeout");
+        assert!(!met, "{detail}");
+        assert!(elapsed >= 1000, "{elapsed}");
+        assert!(begun.elapsed() < Duration::from_secs(5));
+        assert!(detail.contains("not a regular file"), "{detail}");
+    }
+    // The connection is still fine.
+    let (met, _, detail) = wait(
+        &c,
+        Condition::FileExists {
+            path: b"fifo".to_vec(),
+        },
+        1000,
+    )
+    .await;
+    assert!(met, "{detail}");
+}
+
+#[tokio::test]
 async fn a_log_matches_and_jobs_and_processes_end() {
     let env = Env::new();
     let c = env.connect_v2().await;
